@@ -77,10 +77,13 @@ Tell me clearly:
 
    TELEGRAM_TOKEN        = (from @BotFather on Telegram)
    ANTHROPIC_API_KEY     = (from https://console.anthropic.com)
-   YOUR_CHAT_ID          = (the number the bot showed me when I sent /start)
+   CHAT_ID_EN            = (your chat ID from /start — English user)
+   CHAT_ID_PT            = (optional — second user’s ID, or 0)
    DAILY_TIP_HOUR        = 11
    DAILY_TIP_MINUTE      = 0
    OPENAI_API_KEY        = (optional — leave empty if not set up yet)
+
+   Legacy: YOUR_CHAT_ID still works if CHAT_ID_EN is unset (same as old single-user setup).
 
 6. After adding variables, click "Deploy" or it may deploy automatically
 7. Go to the "Logs" tab and watch for the line: "Bot running..."

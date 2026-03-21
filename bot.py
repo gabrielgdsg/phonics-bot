@@ -40,41 +40,96 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)  # avoid logging full Telegram URLs (token)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # avoid logging Telegram URLs (token)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 DAILY_TIP_HOUR    = int(os.getenv("DAILY_TIP_HOUR", "11"))
 DAILY_TIP_MINUTE  = int(os.getenv("DAILY_TIP_MINUTE", "0"))
-YOUR_CHAT_ID      = int(os.getenv("YOUR_CHAT_ID", "0"))
+# CHAT_ID_EN / CHAT_ID_PT: see .env.example. YOUR_CHAT_ID still fills CHAT_ID_EN if unset (Railway migration).
+_legacy_chat_id = int(os.getenv("YOUR_CHAT_ID", "0"))
+CHAT_ID_EN        = int(os.getenv("CHAT_ID_EN", "0")) or _legacy_chat_id
+CHAT_ID_PT        = int(os.getenv("CHAT_ID_PT", "0"))
 
 PROGRESS_FILE = Path("progress.json")
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ── Progress tracking ─────────────────────────────────────────────────────────
+# ── Per-user data (progress + config) ────────────────────────────────────────
+# Stored in progress.json as:
+# {
+#   "lessons": {"en": 1, "pt": 1},
+#   "users": {
+#     "123456789": {
+#       "lang": "en",            # default chat language
+#       "daily_tip": true,       # receive English tip daily
+#       "daily_activity": true,  # receive daily activity
+#       "activity_lang": "en",   # language for activities
+#     },
+#     "987654321": { ... }
+#   }
+# }
 
-def load_progress() -> dict:
+DEFAULT_CONFIG_EN = {
+    "lang": "en",
+    "daily_tip": True,
+    "daily_activity": True,
+    "activity_lang": "en",
+}
+
+DEFAULT_CONFIG_PT = {
+    "lang": "pt",
+    "daily_tip": True,       # English tip even for PT users (as requested)
+    "daily_activity": True,
+    "activity_lang": "pt",
+}
+
+def load_data() -> dict:
     if PROGRESS_FILE.exists():
         try:
             return json.loads(PROGRESS_FILE.read_text())
         except Exception:
             pass
-    return {"en": 1, "pt": 1}
+    return {"lessons": {"en": 1, "pt": 1}, "users": {}}
 
-def save_progress(progress: dict) -> None:
-    PROGRESS_FILE.write_text(json.dumps(progress, indent=2))
+def save_data(data: dict) -> None:
+    PROGRESS_FILE.write_text(json.dumps(data, indent=2))
+
+def get_user_config(chat_id: int) -> dict:
+    data = load_data()
+    uid = str(chat_id)
+    if uid not in data.get("users", {}):
+        # Auto-detect defaults based on known chat IDs
+        default = DEFAULT_CONFIG_PT.copy() if chat_id == CHAT_ID_PT else DEFAULT_CONFIG_EN.copy()
+        data.setdefault("users", {})[uid] = default
+        save_data(data)
+    return data["users"][uid]
+
+def set_user_config(chat_id: int, key: str, value) -> None:
+    data = load_data()
+    uid = str(chat_id)
+    data.setdefault("users", {}).setdefault(uid, DEFAULT_CONFIG_EN.copy())[key] = value
+    save_data(data)
 
 def get_next_lesson(lang: str) -> int:
-    return load_progress().get(lang, 1)
+    return load_data().get("lessons", {}).get(lang, 1)
 
 def mark_lesson_done(lang: str, num: int) -> None:
-    progress = load_progress()
-    # Only advance if this is the current lesson or beyond
-    if num >= progress.get(lang, 1):
-        progress[lang] = min(num + 1, 32)
-    save_progress(progress)
+    data = load_data()
+    lessons = data.setdefault("lessons", {"en": 1, "pt": 1})
+    if num >= lessons.get(lang, 1):
+        lessons[lang] = min(num + 1, 32)
+    save_data(data)
+
+def load_progress() -> dict:
+    """Backwards compat shim — returns lesson progress."""
+    return load_data().get("lessons", {"en": 1, "pt": 1})
+
+def save_progress(progress: dict) -> None:
+    data = load_data()
+    data["lessons"] = progress
+    save_data(data)
 
 # ── System prompts ────────────────────────────────────────────────────────────
 
@@ -269,6 +324,29 @@ def get_lesson_info(lang: str, num: int) -> tuple[str, str]:
     return "❌", f"{'Lesson' if lang == 'en' else 'Lição'} {num} not found. Valid range: 1–32."
 
 
+def user_system(chat_id: int) -> str:
+    """Return default system prompt based on user's configured language."""
+    cfg = get_user_config(chat_id)
+    return SYSTEM_PT if cfg.get("lang") == "pt" else SYSTEM_EN
+
+def user_is_pt(chat_id: int) -> bool:
+    return get_user_config(chat_id).get("lang") == "pt"
+
+def activity_system(chat_id: int) -> str:
+    """Return activity system prompt based on user's activity language preference."""
+    cfg = get_user_config(chat_id)
+    return SYSTEM_ACTIVITIES_PT if cfg.get("activity_lang") == "pt" else SYSTEM_ACTIVITIES_EN
+
+def activity_prompt(chat_id: int) -> str:
+    cfg = get_user_config(chat_id)
+    if cfg.get("activity_lang") == "pt":
+        return DAILY_ACTIVITY_PROMPT
+    return (
+        "Suggest ONE simple home activity for a 2-year-3-month-old child for today. "
+        "Name, learning goal, materials, 3–5 steps, bonus tip. English only. Simple home materials."
+    )
+
+
 def ask_claude(user_message: str, system: str = None) -> str:
     if system is None:
         system = SYSTEM_EN
@@ -374,16 +452,30 @@ async def deliver_lesson(send_fn, lang: str, num: int, mark_done: bool = False) 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    # HTML — MarkdownV2 rejects unescaped ! . * etc. in this text.
-    await update.message.reply_text(
-        "👋 <b>Hello!</b> I'm your English and phonics assistant.\n\n"
-        "💬 Chat freely — any language, I always reply in English\n"
-        "📅 Daily English tip every morning\n"
-        "🎙️ Voice messages supported\n\n"
-        f"Your chat ID: <code>{chat_id}</code> — add to .env as YOUR_CHAT_ID\n\n"
-        "A pinned quick-menu has been set at the top of this chat 📌",
-        parse_mode="HTML",
-    )
+    is_pt = user_is_pt(chat_id)
+
+    # HTML — MarkdownV2 breaks on ! . etc. in *bold* welcome text.
+    if is_pt:
+        welcome = (
+            "👋 <b>Olá!</b> Sou sua assistente de atividades e fonetismo.\n\n"
+            "💬 Fale comigo à vontade — respondo sempre em português\n"
+            "📅 Atividade do dia toda manhã\n"
+            "🎙️ Mensagens de voz também funcionam\n\n"
+            f"Seu chat ID: <code>{chat_id}</code>\n\n"
+            "Um menu rápido foi fixado no topo desta conversa 📌"
+        )
+    else:
+        welcome = (
+            "👋 <b>Hello!</b> I'm your English and phonics assistant.\n\n"
+            "💬 Chat freely — I always reply in English\n"
+            "📅 Daily English tip + activity every morning\n"
+            "🎙️ Voice messages supported\n\n"
+            f"Your chat ID: <code>{chat_id}</code>\n"
+            "Add it to Railway as CHAT_ID_EN (you) or CHAT_ID_PT (wife)\n\n"
+            "A pinned quick-menu has been set at the top of this chat 📌"
+        )
+
+    await update.message.reply_text(welcome, parse_mode="HTML")
 
     # Send and pin the quick-access menu
     menu_keyboard = InlineKeyboardMarkup([
@@ -402,6 +494,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [
             InlineKeyboardButton("💡 Tip of the day",     callback_data="quick_tip"),
             InlineKeyboardButton("📖 Reading tips",       callback_data="quick_reading"),
+        ],
+        [
+            InlineKeyboardButton("⚙️ Settings / Config",  callback_data="quick_config"),
         ],
     ])
     pinned = await context.bot.send_message(
@@ -636,6 +731,113 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             await send(plan, parse_mode="Markdown")
 
+    # Pinned menu: config
+    elif data == "quick_config":
+        chat_id = query.message.chat_id
+        is_pt = user_is_pt(chat_id)
+        title = "⚙️ *Configurações*" if is_pt else "⚙️ *Settings*"
+        subtitle = (
+            "Toque para alternar cada opção\\. As mudanças são imediatas\\."
+            if is_pt else
+            "Tap any option to toggle it\\. Changes take effect immediately\\."
+        )
+        await send(
+            f"{title}\n\n{subtitle}",
+            parse_mode="MarkdownV2",
+            reply_markup=build_config_keyboard(chat_id),
+        )
+    elif data == "cfg_lang":
+        chat_id = query.message.chat_id
+        cfg = get_user_config(chat_id)
+        new_lang = "pt" if cfg.get("lang") == "en" else "en"
+        set_user_config(chat_id, "lang", new_lang)
+        label = "🇧🇷 Português" if new_lang == "pt" else "🇬🇧 English"
+        msg = f"✅ Idioma alterado para {label}!" if new_lang == "pt" else f"✅ Language switched to {label}!"
+        await query.message.edit_reply_markup(reply_markup=build_config_keyboard(chat_id))
+        await send(msg)
+
+    elif data == "cfg_tip":
+        chat_id = query.message.chat_id
+        cfg = get_user_config(chat_id)
+        new_val = not cfg.get("daily_tip", True)
+        set_user_config(chat_id, "daily_tip", new_val)
+        is_pt = user_is_pt(chat_id)
+        msg = (
+            f"{'✅ Dica diária em inglês ativada!' if new_val else '⬜️ Dica diária em inglês desativada.'}"
+            if is_pt else
+            f"{'✅ Daily English tip enabled!' if new_val else '⬜️ Daily English tip disabled.'}"
+        )
+        await query.message.edit_reply_markup(reply_markup=build_config_keyboard(chat_id))
+        await send(msg)
+
+    elif data == "cfg_activity":
+        chat_id = query.message.chat_id
+        cfg = get_user_config(chat_id)
+        new_val = not cfg.get("daily_activity", True)
+        set_user_config(chat_id, "daily_activity", new_val)
+        is_pt = user_is_pt(chat_id)
+        msg = (
+            f"{'✅ Atividade diária ativada!' if new_val else '⬜️ Atividade diária desativada.'}"
+            if is_pt else
+            f"{'✅ Daily activity enabled!' if new_val else '⬜️ Daily activity disabled.'}"
+        )
+        await query.message.edit_reply_markup(reply_markup=build_config_keyboard(chat_id))
+        await send(msg)
+
+    elif data == "cfg_actlang":
+        chat_id = query.message.chat_id
+        cfg = get_user_config(chat_id)
+        new_lang = "pt" if cfg.get("activity_lang") == "en" else "en"
+        set_user_config(chat_id, "activity_lang", new_lang)
+        is_pt = user_is_pt(chat_id)
+        label = "🇧🇷 Português" if new_lang == "pt" else "🇬🇧 English"
+        msg = (
+            f"✅ Atividades agora em {label}!"
+            if is_pt else
+            f"✅ Activities now in {label}!"
+        )
+        await query.message.edit_reply_markup(reply_markup=build_config_keyboard(chat_id))
+        await send(msg)
+
+
+def build_config_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    """Build the config menu keyboard showing current state for this user."""
+    cfg = get_user_config(chat_id)
+    is_pt = cfg.get("lang") == "pt"
+
+    def tog(val: bool) -> str:
+        return "✅" if val else "⬜️"
+
+    lang_label    = f"💬 Chat: {'🇧🇷 Português' if is_pt else '🇬🇧 English'} — tap to switch"
+    tip_label     = f"{tog(cfg.get('daily_tip', True))} Daily English tip"
+    act_label     = f"{tog(cfg.get('daily_activity', True))} Daily activity"
+    act_lang      = cfg.get("activity_lang", "en")
+    act_lang_lbl  = f"🎨 Activity language: {'🇧🇷 PT' if act_lang == 'pt' else '🇬🇧 EN'} — tap to switch"
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(lang_label,    callback_data="cfg_lang")],
+        [InlineKeyboardButton(tip_label,     callback_data="cfg_tip")],
+        [InlineKeyboardButton(act_label,     callback_data="cfg_activity")],
+        [InlineKeyboardButton(act_lang_lbl,  callback_data="cfg_actlang")],
+    ])
+
+
+async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/config — show the per-user settings menu."""
+    chat_id = update.effective_chat.id
+    is_pt = user_is_pt(chat_id)
+    title = "⚙️ *Configurações*" if is_pt else "⚙️ *Settings*"
+    subtitle = (
+        "Toque para alternar cada opção\\. As mudanças são imediatas\\."
+        if is_pt else
+        "Tap any option to toggle it\\. Changes take effect immediately\\."
+    )
+    await update.message.reply_text(
+        f"{title}\n\n{subtitle}",
+        parse_mode="MarkdownV2",
+        reply_markup=build_config_keyboard(chat_id),
+    )
+
 
 # ── Text + voice handlers ─────────────────────────────────────────────────────
 
@@ -721,12 +923,15 @@ async def semana_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    reply = ask_claude(update.message.text, system=SYSTEM_EN)
+    chat_id = update.effective_chat.id
+    reply = ask_claude(update.message.text, system=user_system(chat_id))
     await update.message.reply_text(reply, parse_mode="Markdown")
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("🎙️ Transcribing...")
+    chat_id = update.effective_chat.id
+    is_pt = user_is_pt(chat_id)
+    await update.message.reply_text("🎙️ Transcrevendo..." if is_pt else "🎙️ Transcribing...")
     tg_file = await context.bot.get_file(update.message.voice.file_id)
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
         await tg_file.download_to_drive(tmp.name)
@@ -736,23 +941,29 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if transcript.startswith("["):
         await update.message.reply_text(transcript)
         return
-    await update.message.reply_text(f'🗣️ *You said:* "{transcript}"', parse_mode="Markdown")
-    reply = ask_claude(f"The user said (via voice): {transcript}", system=SYSTEM_EN)
+    said_label = "🗣️ *Você disse:*" if is_pt else "🗣️ *You said:*"
+    await update.message.reply_text(f'{said_label} "{transcript}"', parse_mode="Markdown")
+    reply = ask_claude(f"The user said (via voice): {transcript}", system=user_system(chat_id))
     await update.message.reply_text(reply, parse_mode="Markdown")
 
 
 # ── Daily messages ────────────────────────────────────────────────────────────
 
 async def send_daily_tip(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not YOUR_CHAT_ID:
-        return
-    # English tip
-    tip = ask_claude(DAILY_TIP_PROMPT, system=SYSTEM_EN)
-    await context.bot.send_message(chat_id=YOUR_CHAT_ID, text=tip, parse_mode="Markdown")
+    for chat_id in [CHAT_ID_EN, CHAT_ID_PT]:
+        if not chat_id:
+            continue
+        cfg = get_user_config(chat_id)
 
-    # Portuguese activity nudge
-    activity = ask_claude(DAILY_ACTIVITY_PROMPT, system=SYSTEM_ACTIVITIES_PT)
-    await context.bot.send_message(chat_id=YOUR_CHAT_ID, text=activity, parse_mode="Markdown")
+        # English tip — sent to everyone who has it enabled
+        if cfg.get("daily_tip", True):
+            tip = ask_claude(DAILY_TIP_PROMPT, system=SYSTEM_EN)
+            await context.bot.send_message(chat_id=chat_id, text=tip, parse_mode="Markdown")
+
+        # Daily activity — language follows user's activity_lang config
+        if cfg.get("daily_activity", True):
+            act = ask_claude(activity_prompt(chat_id), system=activity_system(chat_id))
+            await context.bot.send_message(chat_id=chat_id, text=act, parse_mode="Markdown")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -770,18 +981,18 @@ def main() -> None:
     app.add_handler(CommandHandler("atividade",  atividade_command))
     app.add_handler(CommandHandler("atividades", atividade_command))
     app.add_handler(CommandHandler("semana",     semana_command))
+    app.add_handler(CommandHandler("config",     config_command))
     app.add_handler(CommandHandler("help",       help_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    if YOUR_CHAT_ID:
+    if CHAT_ID_EN or CHAT_ID_PT:
         app.job_queue.run_daily(
             send_daily_tip,
             time=time(hour=DAILY_TIP_HOUR, minute=DAILY_TIP_MINUTE),
-            chat_id=YOUR_CHAT_ID,
         )
-        logger.info(f"Daily tip scheduled at {DAILY_TIP_HOUR:02d}:{DAILY_TIP_MINUTE:02d}")
+        logger.info(f"Daily messages scheduled at {DAILY_TIP_HOUR:02d}:{DAILY_TIP_MINUTE:02d}")
 
     logger.info("Bot running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
