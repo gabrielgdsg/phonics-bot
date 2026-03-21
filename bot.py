@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 """
-English + Portuguese Phonics Telegram Bot — v3
-New in this version:
-  /course  — tap buttons to pick English CLR or Portuguese Fonética
-  /next en — jump to your next English lesson automatically
-  /next pt — jump to your next Portuguese lesson automatically
-  Progress is saved in progress.json and persists across restarts
-  /lesson pt N — responds entirely in Portuguese
-  /lesson en N — responds in English
+English + Portuguese Phonics Telegram Bot — v4
+Features:
+  /course          — tap buttons to pick English CLR or Portuguese Fonética
+  /next en|pt      — jump to your next lesson automatically
+  /lesson en|pt N  — open a specific lesson
+  /semana          — generate a full weekly activity plan (PT) with printout bundle
+  /atividade       — today's activity idea in Portuguese
+  /atividades en   — today's activity idea in English
+  /falar <word>    — bot sends a voice message pronouncing the word correctly (TTS)
+  Daily morning message: English tip + Portuguese activity nudge
+  Progress saved in progress.json
 """
 
 import os
 import json
 import logging
 import tempfile
-from datetime import time
+from datetime import time, date
 from pathlib import Path
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -114,6 +116,79 @@ Format exactly like this:
 [A song, game, or routine that reinforces this word naturally for a 2-year-old]
 
 Pick something genuinely useful for daily home life. Think: daylight, tidy up, splash around, peek-a-boo, all done, gentle, careful, well done, let's go, come here, look at that.
+"""
+
+# ── Activity system prompts ───────────────────────────────────────────────────
+
+SYSTEM_ACTIVITIES_PT = """Você é um assistente especializado em atividades para crianças pequenas, 
+ajudando uma mãe brasileira que fica em casa com sua filha de 2 anos e 3 meses.
+
+Regras:
+- Responda SEMPRE em português brasileiro, de forma calorosa e prática.
+- As atividades devem usar materiais simples que já existem em casa (papel, pote, água, arroz, tinta, etc).
+- Quando precisar de algo especial, diga que pode ser impresso ou comprado barato.
+- Adapte sempre para a faixa etária: 2 anos e 3 meses — curiosa, ativa, aprende com repetição e brincadeira.
+- Inclua sempre: objetivo da atividade (o que ela aprende), materiais, passo a passo simples, e uma dica extra.
+- Categorias possíveis: sensorial, artes, movimento, culinária, livros, educacional (números/cores/formas).
+- Seja animada e encorajadora — a mãe precisa de inspiração, não de pressão.
+"""
+
+SYSTEM_ACTIVITIES_EN = """You are a specialist in activities for young children,
+helping a Brazilian stay-at-home parent with their 2-year-3-month-old daughter.
+
+Rules:
+- Reply in English only.
+- Activities must use simple materials already at home (paper, containers, water, rice, paint, etc).
+- Always adapted for age 2y3m — curious, active, learns through repetition and play.
+- Always include: learning goal, materials, simple steps, and a bonus tip.
+- Categories: sensory play, arts & crafts, movement, cooking together, storytime, educational (numbers/colors/shapes).
+- Be warm and encouraging.
+"""
+
+DAILY_ACTIVITY_PROMPT = """Sugira UMA atividade para hoje para uma criança de 2 anos e 3 meses.
+A mãe está em casa e precisa de algo simples, divertido e que não bagunce muito.
+
+Formato exato:
+🎨 *Atividade do dia*
+[nome da atividade]
+
+🎯 *O que ela aprende*
+[objetivo em uma linha]
+
+🧺 *O que você vai precisar*
+[lista curta de materiais simples]
+
+👣 *Como fazer*
+[3 a 5 passos bem simples]
+
+💡 *Dica extra*
+[uma dica prática para a mãe]
+
+Varie entre: sensorial, artes, movimento, culinária, livros, educacional.
+"""
+
+WEEKLY_PLAN_PROMPT = """Crie um plano semanal de atividades (segunda a domingo) para uma criança de 2 anos e 3 meses.
+A mãe está em casa com ela o dia todo. Use materiais simples que já existem em casa.
+
+Para cada dia, forneça:
+- Nome da atividade
+- Categoria (sensorial / artes / movimento / culinária / livros / educacional)
+- Materiais necessários
+- Passos simples (máximo 4)
+- O que a criança aprende
+
+No final, depois dos 7 dias, adicione uma seção:
+📋 *PARA IMPRIMIR ESTA SEMANA*
+Liste todos os itens que precisam ser impressos (moldes, cartões, fichas) com uma descrição simples de cada um.
+Se não houver nada para imprimir, diga "Nenhum impresso necessário esta semana — aproveite!"
+
+Formato de cada dia:
+━━━━━━━━━━━━━━
+📅 *[DIA DA SEMANA]*
+🎯 [Nome da atividade] — _[categoria]_
+🧺 Materiais: [lista]
+👣 [passo 1] / [passo 2] / [passo 3]
+🌱 Aprende: [objetivo]
 """
 
 # ── CLR English lesson data ───────────────────────────────────────────────────
@@ -220,6 +295,30 @@ async def transcribe_voice(file_bytes: bytes) -> str:
         return resp.json().get("text", "")
 
 
+async def text_to_speech(text: str) -> bytes | None:
+    """Convert text to speech using OpenAI TTS. Returns mp3 bytes or None."""
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if not openai_key:
+        return None
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/audio/speech",
+            headers={
+                "Authorization": f"Bearer {openai_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "tts-1",
+                "input": text,
+                "voice": "nova",   # clear, friendly female voice
+                "speed": 0.85,     # slightly slower — easier to follow
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.content
+
+
 async def deliver_lesson(send_fn, lang: str, num: int, mark_done: bool = False) -> None:
     """Fetch lesson info + Claude enrichment and send to user."""
     label, tips = get_lesson_info(lang, num)
@@ -273,15 +372,14 @@ async def deliver_lesson(send_fn, lang: str, num: int, mark_done: bool = False) 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    # Use HTML here — MarkdownV2 rejected this text before (unescaped ! and . inside *bold*).
     await update.message.reply_text(
-        "👋 <b>Hello!</b> I'm your English and phonics assistant.\n\n"
-        "💬 Chat freely — any language, I always reply in English\n"
-        "📅 Daily English tip every morning\n"
-        "🎙️ Voice messages supported\n\n"
-        f"Your chat ID: <code>{chat_id}</code> — add to .env as YOUR_CHAT_ID\n\n"
-        "A pinned quick-menu has been set at the top of this chat 📌",
-        parse_mode="HTML",
+        f"👋 *Hello! I'm your English and phonics assistant.*\n\n"
+        f"💬 Chat freely — any language, I always reply in English\n"
+        f"📅 Daily English tip every morning\n"
+        f"🎙️ Voice messages supported\n\n"
+        f"Your chat ID: `{chat_id}` — add to .env as YOUR\\_CHAT\\_ID\n\n"
+        f"A pinned quick\\-menu has been set at the top of this chat 📌",
+        parse_mode="MarkdownV2",
     )
 
     # Send and pin the quick-access menu
@@ -295,6 +393,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             InlineKeyboardButton("⏭️ Próxima PT lição",   callback_data="next_pt"),
         ],
         [
+            InlineKeyboardButton("🎨 Atividade do dia",   callback_data="quick_activity"),
+            InlineKeyboardButton("📅 Plano da semana",    callback_data="quick_semana"),
+        ],
+        [
             InlineKeyboardButton("💡 Tip of the day",     callback_data="quick_tip"),
             InlineKeyboardButton("📖 Reading tips",       callback_data="quick_reading"),
         ],
@@ -306,14 +408,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=menu_keyboard,
     )
     # Pin it (disable notification so it doesn't spam)
-    try:
-        await context.bot.pin_chat_message(
-            chat_id=chat_id,
-            message_id=pinned.message_id,
-            disable_notification=True,
-        )
-    except TelegramError as e:
-        logger.warning("Could not pin quick menu (you still have the menu above): %s", e)
+    await context.bot.pin_chat_message(
+        chat_id=chat_id,
+        message_id=pinned.message_id,
+        disable_notification=True,
+    )
 
 
 async def course_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -410,14 +509,20 @@ async def reading_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🤖 *Commands:*\n\n"
+        "*Courses:*\n"
         "📚 /course — pick a course with buttons\n"
         "⏭️ /next en — next English lesson\n"
         "⏭️ /next pt — next Portuguese lesson\n"
         "📖 /lesson en 14 — specific English lesson\n"
-        "📖 /lesson pt 7 — specific Portuguese lesson\n"
+        "📖 /lesson pt 7 — specific Portuguese lesson\n\n"
+        "*Activities:*\n"
+        "🎨 /atividade — activity of the day (Portuguese)\n"
+        "🎨 /atividade en — activity of the day (English)\n"
+        "📅 /semana — full weekly plan + printout list\n\n"
+        "*English learning:*\n"
+        "🔊 /falar <word> — hear correct pronunciation\n"
         "💡 /tip — word of the day\n"
-        "📖 /reading — literacy guidance\n"
-        "❓ /help — this menu\n\n"
+        "📖 /reading — literacy guidance\n\n"
         "Or send any text or voice message!",
         parse_mode="Markdown",
     )
@@ -507,8 +612,108 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         await send(advice, parse_mode="Markdown")
 
+    # Pinned menu: activity of the day
+    elif data == "quick_activity":
+        await send("🎨 Buscando a atividade do dia...")
+        activity = ask_claude(DAILY_ACTIVITY_PROMPT, system=SYSTEM_ACTIVITIES_PT)
+        await send(activity, parse_mode="Markdown")
+
+    # Pinned menu: weekly plan
+    elif data == "quick_semana":
+        await send("📅 Criando o plano da semana... aguarde!")
+        plan = ask_claude(WEEKLY_PLAN_PROMPT, system=SYSTEM_ACTIVITIES_PT)
+        if len(plan) > 4000:
+            mid = plan.find("━━━", 2000)
+            if mid == -1:
+                mid = 2000
+            await send(plan[:mid], parse_mode="Markdown")
+            await send(plan[mid:], parse_mode="Markdown")
+        else:
+            await send(plan, parse_mode="Markdown")
+
 
 # ── Text + voice handlers ─────────────────────────────────────────────────────
+
+async def falar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/falar <word or phrase> — sends a TTS voice message with correct pronunciation."""
+    if not context.args:
+        await update.message.reply_text(
+            "Use: `/falar thoroughly`\nI'll send you a voice message with the correct pronunciation.",
+            parse_mode="Markdown",
+        )
+        return
+
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if not openai_key:
+        await update.message.reply_text(
+            "Voice not set up yet — add `OPENAI_API_KEY` to your .env file.",
+            parse_mode="Markdown",
+        )
+        return
+
+    word = " ".join(context.args)
+    await update.message.reply_text(f"🔊 Pronouncing: *{word}*...", parse_mode="Markdown")
+
+    # Ask Claude for pronunciation context first
+    explanation = ask_claude(
+        f"Give a very brief pronunciation guide for the English word or phrase: '{word}'. "
+        f"One sentence max. Focus on sounds a Brazilian speaker finds tricky. English only.",
+        system=SYSTEM_EN,
+    )
+
+    audio_bytes = await text_to_speech(word)
+    if audio_bytes:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+        with open(tmp_path, "rb") as f:
+            await update.message.reply_voice(voice=f, caption=f"🗣️ *{word}*\n\n{explanation}", parse_mode="Markdown")
+        os.unlink(tmp_path)
+    else:
+        await update.message.reply_text(f"🗣️ *{word}*\n\n{explanation}", parse_mode="Markdown")
+
+
+async def atividade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/atividade — today's activity in Portuguese. /atividades en — in English."""
+    args = context.args
+    lang = args[0].lower() if args and args[0].lower() == "en" else "pt"
+
+    if lang == "en":
+        await update.message.reply_text("🎨 Getting today's activity...")
+        result = ask_claude(
+            "Suggest ONE simple home activity for a 2-year-3-month-old child for today. "
+            "Use the same format as usual: name, learning goal, materials, steps, bonus tip. "
+            "English only. Use simple materials found at home.",
+            system=SYSTEM_ACTIVITIES_EN,
+        )
+    else:
+        await update.message.reply_text("🎨 Buscando a atividade do dia...")
+        result = ask_claude(DAILY_ACTIVITY_PROMPT, system=SYSTEM_ACTIVITIES_PT)
+
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+
+async def semana_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/semana — full weekly activity plan in Portuguese with printout bundle."""
+    await update.message.reply_text(
+        "📅 Criando o plano da semana... isso pode levar alguns segundos!"
+    )
+    plan = ask_claude(WEEKLY_PLAN_PROMPT, system=SYSTEM_ACTIVITIES_PT)
+
+    # Split if too long for one message
+    if len(plan) > 4000:
+        mid = plan.find("━━━", 2000)
+        if mid == -1:
+            mid = 2000
+        await update.message.reply_text(plan[:mid], parse_mode="Markdown")
+        await update.message.reply_text(plan[mid:], parse_mode="Markdown")
+    else:
+        await update.message.reply_text(plan, parse_mode="Markdown")
+
+    await update.message.reply_text(
+        "💡 *Dica:* Salve esse plano e imprima os itens listados na seção 'Para Imprimir' antes de segunda\\-feira\\!",
+        parse_mode="MarkdownV2",
+    )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     reply = ask_claude(update.message.text, system=SYSTEM_EN)
@@ -531,13 +736,18 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(reply, parse_mode="Markdown")
 
 
-# ── Daily tip ─────────────────────────────────────────────────────────────────
+# ── Daily messages ────────────────────────────────────────────────────────────
 
 async def send_daily_tip(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not YOUR_CHAT_ID:
         return
+    # English tip
     tip = ask_claude(DAILY_TIP_PROMPT, system=SYSTEM_EN)
     await context.bot.send_message(chat_id=YOUR_CHAT_ID, text=tip, parse_mode="Markdown")
+
+    # Portuguese activity nudge
+    activity = ask_claude(DAILY_ACTIVITY_PROMPT, system=SYSTEM_ACTIVITIES_PT)
+    await context.bot.send_message(chat_id=YOUR_CHAT_ID, text=activity, parse_mode="Markdown")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -545,13 +755,17 @@ async def send_daily_tip(context: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",   start))
-    app.add_handler(CommandHandler("course",  course_command))
-    app.add_handler(CommandHandler("next",    next_command))
-    app.add_handler(CommandHandler("lesson",  lesson_command))
-    app.add_handler(CommandHandler("tip",     tip_command))
-    app.add_handler(CommandHandler("reading", reading_command))
-    app.add_handler(CommandHandler("help",    help_command))
+    app.add_handler(CommandHandler("start",      start))
+    app.add_handler(CommandHandler("course",     course_command))
+    app.add_handler(CommandHandler("next",       next_command))
+    app.add_handler(CommandHandler("lesson",     lesson_command))
+    app.add_handler(CommandHandler("tip",        tip_command))
+    app.add_handler(CommandHandler("reading",    reading_command))
+    app.add_handler(CommandHandler("falar",      falar_command))
+    app.add_handler(CommandHandler("atividade",  atividade_command))
+    app.add_handler(CommandHandler("atividades", atividade_command))
+    app.add_handler(CommandHandler("semana",     semana_command))
+    app.add_handler(CommandHandler("help",       help_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
