@@ -22,6 +22,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -39,6 +40,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)  # avoid logging full Telegram URLs (token)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
@@ -372,14 +374,15 @@ async def deliver_lesson(send_fn, lang: str, num: int, mark_done: bool = False) 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+    # HTML — MarkdownV2 rejects unescaped ! . * etc. in this text.
     await update.message.reply_text(
-        f"👋 *Hello! I'm your English and phonics assistant.*\n\n"
-        f"💬 Chat freely — any language, I always reply in English\n"
-        f"📅 Daily English tip every morning\n"
-        f"🎙️ Voice messages supported\n\n"
-        f"Your chat ID: `{chat_id}` — add to .env as YOUR\\_CHAT\\_ID\n\n"
-        f"A pinned quick\\-menu has been set at the top of this chat 📌",
-        parse_mode="MarkdownV2",
+        "👋 <b>Hello!</b> I'm your English and phonics assistant.\n\n"
+        "💬 Chat freely — any language, I always reply in English\n"
+        "📅 Daily English tip every morning\n"
+        "🎙️ Voice messages supported\n\n"
+        f"Your chat ID: <code>{chat_id}</code> — add to .env as YOUR_CHAT_ID\n\n"
+        "A pinned quick-menu has been set at the top of this chat 📌",
+        parse_mode="HTML",
     )
 
     # Send and pin the quick-access menu
@@ -407,12 +410,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="Markdown",
         reply_markup=menu_keyboard,
     )
-    # Pin it (disable notification so it doesn't spam)
-    await context.bot.pin_chat_message(
-        chat_id=chat_id,
-        message_id=pinned.message_id,
-        disable_notification=True,
-    )
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=chat_id,
+            message_id=pinned.message_id,
+            disable_notification=True,
+        )
+    except TelegramError as e:
+        logger.warning("Could not pin quick menu: %s", e)
 
 
 async def course_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
