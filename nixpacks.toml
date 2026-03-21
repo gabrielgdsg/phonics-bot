@@ -1,0 +1,3 @@
+# Pin Python for Railway / Nixpacks (avoids broken mise python@3.13.x installs)
+[variables]
+NIXPACKS_PYTHON_VERSION = "3.12"
