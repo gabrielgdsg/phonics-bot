@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""
+English + Portuguese Phonics Telegram Bot — v3
+New in this version:
+  /course  — tap buttons to pick English CLR or Portuguese Fonética
+  /next en — jump to your next English lesson automatically
+  /next pt — jump to your next Portuguese lesson automatically
+  Progress is saved in progress.json and persists across restarts
+  /lesson pt N — responds entirely in Portuguese
+  /lesson en N — responds in English
+"""
+
+import os
+import json
+import logging
+import tempfile
+from datetime import time
+from pathlib import Path
+from dotenv import load_dotenv
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TelegramError
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+import anthropic
+import httpx
+
+load_dotenv()
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+DAILY_TIP_HOUR    = int(os.getenv("DAILY_TIP_HOUR", "11"))
+DAILY_TIP_MINUTE  = int(os.getenv("DAILY_TIP_MINUTE", "0"))
+YOUR_CHAT_ID      = int(os.getenv("YOUR_CHAT_ID", "0"))
+
+PROGRESS_FILE = Path("progress.json")
+
+claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# ── Progress tracking ─────────────────────────────────────────────────────────
+
+def load_progress() -> dict:
+    if PROGRESS_FILE.exists():
+        try:
+            return json.loads(PROGRESS_FILE.read_text())
+        except Exception:
+            pass
+    return {"en": 1, "pt": 1}
+
+def save_progress(progress: dict) -> None:
+    PROGRESS_FILE.write_text(json.dumps(progress, indent=2))
+
+def get_next_lesson(lang: str) -> int:
+    return load_progress().get(lang, 1)
+
+def mark_lesson_done(lang: str, num: int) -> None:
+    progress = load_progress()
+    # Only advance if this is the current lesson or beyond
+    if num >= progress.get(lang, 1):
+        progress[lang] = min(num + 1, 32)
+    save_progress(progress)
+
+# ── System prompts ────────────────────────────────────────────────────────────
+
+SYSTEM_EN = """You are a warm, encouraging English teacher assistant for a Brazilian Portuguese speaker who is:
+1. Learning English themselves (intermediate level).
+2. Teaching English to their 2-year-old daughter using the Children Learning Reading (CLR) phonics method by Jim Yang.
+3. Also teaching Portuguese phonics using an adapted CLR method for Brazilian Portuguese.
+
+Rules:
+- ALWAYS reply in English only. Do NOT add Portuguese translations unless the user explicitly asks.
+- If the user writes in Portuguese, understand it naturally and reply in English.
+- Keep answers practical, warm, and encouraging.
+- For grammar corrections, show the correct form gently — never make the user feel bad.
+- The daughter is 2 years and 3 months old and speaks a lot of Portuguese already.
+"""
+
+SYSTEM_PT = """Você é um assistente de fonetismo caloroso e encorajador para uma criança brasileira de 2 anos e 3 meses.
+O pai/mãe está ensinando português usando um método adaptado do CLR (Children Learning Reading) de Jim Yang.
+
+Regras:
+- Responda SEMPRE em português brasileiro.
+- Seja caloroso, prático e encorajador.
+- Dê dicas concretas e acionáveis para sessões curtas (3–5 minutos) com uma criança pequena.
+- Use linguagem simples — o pai/mãe está aprendendo junto com a criança.
+"""
+
+DAILY_TIP_PROMPT = """Generate a daily English tip for a Brazilian parent learning English and teaching it to their 2-year-old.
+
+Format exactly like this:
+🌟 *Word or Expression of the Day*
+[word or expression]
+
+📖 *What it means*
+[simple, clear definition — English only]
+
+🏠 *Use it at home today*
+• "[example sentence with toddler]"
+• "[example sentence for adult use]"
+
+🎵 *Toddler tip*
+[A song, game, or routine that reinforces this word naturally for a 2-year-old]
+
+Pick something genuinely useful for daily home life. Think: daylight, tidy up, splash around, peek-a-boo, all done, gentle, careful, well done, let's go, come here, look at that.
+"""
+
+# ── CLR English lesson data ───────────────────────────────────────────────────
+CLR_EN_LESSONS = {
+    (1,6):  ("Letters A, B, C, T", "Introduce each letter sound one at a time. Words: AB, CAB, AT, BAT, CAT. Say the SOUND not the name — 'a' as in apple, not 'ay'. Keep sessions to 3–5 minutes max."),
+    (7,9):  ("Adding U", "New sound: U. Words: BUT, CUT, CUB, TUB, TAB. Practice blending slowly: C-U-B = CUB. Always left to right, finger under each letter."),
+    (10,10):("Adding S", "New sound: S. Words: SAT, BUS, SUB, STUB, BATS, CAST. First sentences: 'The cat sat.' Point to each word as you read aloud."),
+    (11,12):("Adding P", "New sound: P. Words: PAT, TAP, PUB, CUP, PASS. Sentence: 'Pass the cup.' Clap the sounds: P-A-T = PAT."),
+    (13,13):("Adding O", "New vowel: O. Words: BOT, COP, POP, POT, SPOT, STOP. Point to real STOP signs outside — instant recognition moment!"),
+    (14,14):("Adding H", "New sound: H. Words: HAS, HAT, HUT, HOT, HOP. Sentence: 'He has a hat.' Ask her: where's YOUR hat?"),
+    (15,15):("Adding N", "New sound: N. Words: NOT, BUN, CAN, PAN, TAN, PANTS. Sentence: 'I can hop.' Turn it into a physical game."),
+    (16,16):("Review",   "No new letter. Review all words from lessons 1–15. Go through flashcards quickly — celebrate fast recognition with claps."),
+    (17,17):("Adding G", "New sound: G. Words: HOG, BAG, BUG, TUG, HUG. Sentence: 'Give me a hug!' Make it physical — toddlers love hugs."),
+    (18,18):("Adding D", "New sound: D. Words: DAD, HAD, SAD, DOG, HAND, SAND. Sentence: 'Dad had a hot dog.' She'll love hearing DAD in print."),
+    (19,19):("Adding I", "New vowel: I. Words: HIS, DID, HIT, BIT, PIT, SIT, PIN, BIN. Keep it silly — 'Sit in the bin!' Toddlers love absurd sentences."),
+    (20,20):("Adding F", "New sound: F. Words: FOG, FUN, FAN, FIT, FAST, FAT. Speed up 'The fat cat is so fast' each time — she'll giggle."),
+    (21,21):("Adding R", "New sound: R. Words: RAT, RUG, RUN, FROG, DROP, CRIB. 'The rat drags the frog.' Make it dramatic and silly."),
+    (22,22):("Adding M", "New sound: M. Words: MUD, MAP, MAN, MOM, MAT, MUFFIN. 'I miss mom and dad.' Very emotionally resonant."),
+    (23,23):("Adding E", "New vowel: E. Words: BED, RED, PET, NET, REST, BEST. 'Ted's pet rests on the bed.' Perfect for bedtime reading."),
+    (24,24):("Adding J and K", "New sounds: J, K. Words: JAM, JOG, JUMP, BACK, PACK, KICK, TICKET. 'Jack just had jam.' Practice KICK — fun to say and do."),
+    (25,25):("Lowercase", "Same words now in lowercase. Show her 'CAT' and 'cat' are the same word — just a different outfit. Go one word at a time."),
+    (26,26):("Adding L", "New sound: L. Words: LOT, LOG, LAND, CLOCK, LOCK, BALL, BELL. 'Lots of dogs got lost.' Count the L words together."),
+    (27,27):("Adding X", "New sound: X. Words: BOX, SIX, MIX, FOX, TEXT, RELAX. 'The cat, hat, and bat are mixed in the box.' Great physical sorting game."),
+    (28,28):("Adding Y", "New sound: Y. Words: FUNNY, BUNNY, SUNNY, YUMMY, SILLY, MOMMY, DADDY. 'The funny bunny is smelly.' She will LOVE this one."),
+    (29,29):("Adding QU", "New sound: QU (always together). Words: QUIT, QUICK, QUIET, QUILT. 'It is so quiet.' Great for whispering at bedtime."),
+    (30,30):("W and WH", "Words: WILL, WIN, WHY, WHEN, WHAT, WHERE. These are question words — use them in real questions during the day."),
+    (31,31):("Adding V", "New sound: V. Words: VAN, VET, GIVE, HAVE, GLOVE. Talk about what a vet does — great if she loves animals."),
+    (32,32):("Adding Z", "New sound: Z. Words: ZIP, ZAP, BUZZ, FIZZ, QUIZ. 'Run in a zig zag.' Make it a physical game — run zig zag together!"),
+}
+
+# ── Portuguese phonics lesson data (32 individual entries) ────────────────────
+CLR_PT_LESSONS = {
+    (1,1):  ("Vogal A", "Apresente apenas a letra A hoje. Diga o SOM 'ah' — não o nome. Palavras: AMÁ, AI, AVÓ. Aponte para objetos reais: ÁGUA, AVIÃO. Sessão de 3 minutos. Repita 'A... A... A...' e deixe ela copiar. Uma letra, muitas repetições — só isso por hoje."),
+    (2,2):  ("Vogal E", "Som novo: 'eh' como em ELA. Palavras: ELA, EU, ELE. Compare com o A da sessão anterior — segure dois cartões e peça para ela apontar para o A, depois o E. A diferença entre 'ah' e 'eh' é a lição toda de hoje."),
+    (3,3):  ("Vogal I", "Som novo: 'ee' como em IDA. Palavras: IDA, IR, IA. Agora você tem A E I — jogue um jogo simples: fale um som, ela aponta para o cartão certo. 'Onde está o I?' Três vogais já são suficientes para uma criança pequena. Elogie cada acerto."),
+    (4,4):  ("Vogal O", "Som novo: 'oh' como em OVO. Palavras: OVO, OI, OSO. OI é perfeito — ela fala toda hora como cumprimento. Mostre a palavra OI e veja a reação dela. Quatro vogais agora: A E I O."),
+    (5,5):  ("Vogal U", "Som novo: 'u' como em UVA. Palavras: UVA, UM, UÊ. Segure uma uva (ou figura) e diga U-VA devagar. Agora você tem as cinco vogais. Passe essa sessão toda revisando: A E I O U em ordem, depois misturadas."),
+    (6,6):  ("Revisão das 5 vogais", "Sem letra nova hoje. Revisão completa: A E I O U. Coloque os cinco cartões no chão. Fale um som — ela corre para o cartão certo. Torne físico e divertido. Cronometre quantos segundos ela leva para achar cada um. Comemore cada acerto. Essa é a base de tudo."),
+    (7,7):  ("Consoante M", "Som novo: 'mm' — lábios fechados, depois abre. Palavras: MÃE, MÃO, MAMÃ, MIAU. MÃE é a palavra mais poderosa do vocabulário dela — ver escrita pela primeira vez é um momento especial. Una devagar: M... Ã... E... = MÃE. Deixe ela segurar o cartão quando acertar."),
+    (8,8):  ("Consoante P", "Som novo: 'p' — um pequeno sopro de ar. Palavras: PAI, PÉ, PIA, PIPA. PAI é sua arma secreta — ela fala dezenas de vezes por dia. O momento em que ela ler PAI sozinha será inesquecível. Una: P... A... I... = PAI. Pratique MÃE + PAI lado a lado."),
+    (9,9):  ("Consoante B", "Som novo: 'b' — como P mas com voz. Palavras: BOLA, BEBÊ, BOCA. Role uma bola pelo chão e diga B-O-L-A a cada rolada. A ação física grava a palavra. Tente também BEBÊ com uma boneca — ela pode segurar o 'bebê' enquanto lê o cartão."),
+    (10,10):("Consoante T + Revisão", "Som novo: 't' — língua no céu da boca. Palavras: TATU, TETO, PATO, BOTA. Revise M P B primeiro — passe pelos cartões antes de introduzir o T. PATO é ótimo: faça ele grasnar toda vez que ela ler. Frases: 'O PATO É MIO.' 'A BOTA É MIA.'"),
+    (11,11):("Consoante D", "Som novo: 'd' — como T mas com voz. Palavras: DEDO, DADO, DORME. Toque o dedo dela e diga D-E-D-O — a palavra e a parte do corpo ao mesmo tempo. Essa conexão tátil é poderosa para crianças pequenas. Tente DORME na hora de dormir: 'hora de DORME?'"),
+    (12,12):("Consoante V", "Som novo: 'v' — dente de cima no lábio de baixo, vibrando. Palavras: VACA, VELA, VOVÓ, UVA. VOVÓ é emocionalmente poderosa — se a avó é presente na vida dela, ver o nome escrito é mágico. Faça a vaca mugir para VACA. Segure uma uva para UVA."),
+    (13,13):("Consoante F", "Som novo: 'f' — mesma posição que o V mas sem vibração. Palavras: FADA, FOCA, FOFA, FOME. FOFA ela ouve o tempo todo — 'que FOFA!' Ver escrito vai arrancá-la uma gargalhada. Compare V e F: mesma boca, um vibra, o outro não."),
+    (14,14):("Consoante N", "Som novo: 'n' — língua no céu da boca, som sai pelo nariz. Palavras: NANA, NINHO, NEVE, NABO. Use NANA na hora de dormir — é a palavra mais suave do conjunto. 'NANA, NANA' enquanto balança. NINHO com figura de ninho de pássaro é bonito e memorável."),
+    (15,15):("Revisão geral — Lição 15", "Sem letra nova. Revisão completa das lições 7–14: M P B T D V F N. Coloque todos os cartões no chão. Você fala FADA, ela acha. Depois troca: ela escolhe um cartão, você lê juntos. Comemore cada acerto em voz alta. Anote quais palavras ela hesita — revise essas amanhã."),
+    (16,16):("Consoante L", "Som novo: 'l' — ponta da língua no céu, lados abertos. Palavras: LEÃO, LOBO, BOLO, LAMA, LUA. BOLO é ótimo motivador — prometa um bolo de verdade depois de uma boa sessão! LEÃO e LOBO são animais empolgantes. LUA é linda para uma sessão noturna — olhem a lua juntos."),
+    (17,17):("Consoante C (CA CO CU)", "Som novo: 'k' duro — MAS APENAS antes de A, O, U hoje. Palavras: CAMA, COPO, CUBO, CUCO. CAMA é perfeita — ela conhece a própria cama profundamente. Importante: NÃO introduza CE ou CI ainda. Esses têm um som completamente diferente e chegam na lição 26. Diga claramente: 'C antes de A faz KA. C antes de O faz KO.'"),
+    (18,18):("Consoante G (GA GO GU)", "Som novo: 'g' duro — APENAS antes de A, O, U. Palavras: GATO, GOLA, GUGU, PEGA. GATO é maravilhoso se ela ama gatos. GUGU é instantaneamente reconhecível. Mesma regra do C: NÃO introduza GE ou GI ainda — chegam depois com som diferente."),
+    (19,19):("Consoante R (som suave)", "Som novo: R suave — apenas entre vogais, como em 'cara'. Palavras: CARA, PURO, FORA, CARO, TIRO. Este é o R gentil, NÃO o R forte do início das palavras. Em CARA o R é suave como um toque leve. O R forte (como em RATO) fica para o Estágio 2. Por agora: R apenas no meio das palavras."),
+    (20,20):("Consoante S", "Som novo: 's' — ar entre os dentes. Palavras: SAPO, SUCO, MESA, SOLO. SAPO PULA é uma música folclórica brasileira famosa — se ela conhece, ver SAPO escrito é um momento enorme de reconhecimento. Pergunte: 'O sapo pula... onde?' Aponte para SAPO no cartão enquanto ela canta."),
+    (21,21):("Revisão + Frases completas", "Sem letra nova. Revisão das lições 16–20: L C G R S. Agora monte frases completas com os cartões: 'O GATO DORME NA CAMA.' 'O SAPO PULA NA LAMA.' Passe o dedo sob cada palavra da esquerda para a direita ao ler em voz alta. Esse é um momento grande — ela está lendo frases em português."),
+    (22,22):("Dígrafo LH", "Som novo: LH — um som único do português, como 'lh' em 'talha' ou 'lli' em 'million'. Palavras: FILHO, FOLHA, OLHA, GALHO. OLHA! é o mais natural — você já fala o tempo todo: 'OLHA o gatinho!' 'OLHA a lua!' Use em momentos reais hoje. Toda vez que falar OLHA, aponte para algo e faça a conexão com o cartão."),
+    (23,23):("Dígrafo NH", "Som novo: NH — nasal, como 'ny' em 'canyon'. Palavras: NINHO, BANHO, MINHA, LINHA. HORA DO BANHO é dito todos os dias — escreva num cartão e mostre na hora do banho. MINHA BOLA, MINHA CAMA — o possessivo MINHA dá a ela propriedade sobre palavras que ela ama."),
+    (24,24):("Dígrafo CH", "Som novo: CH — como 'sh' em inglês. Palavras: CHÃO, CHUVA, BICHO, CHAVE. CH é na verdade fácil para crianças pequenas porque o som é muito claro. CAI NO CHÃO é algo que ela vive — crianças pequenas caem muito! Conecte a palavra ao momento real quando acontecer hoje."),
+    (25,25):("Letra X (som CH)", "Letra nova: X — mas hoje APENAS o som 'ch/sh'. Palavras: XÍCARA, XALE, PEIXE, CAIXA, ROXO. Importante: X tem quatro sons possíveis em português. Não mencione essa complexidade ainda. Ensine apenas: 'X pode soar como CH.' PEIXE é ótimo com figura ou brinquedo de peixe. CAIXA — coloque um brinquedo dentro de uma caixa e rotule."),
+    (26,26):("J e G suave (GE GI)", "Duas letras, um som: 'j' suave — como o 's' em 'leisure' em inglês. Palavras: JOGO, HOJE, GELO, GIRAFA, FEIJÃO. J sempre faz esse som. G faz esse som APENAS antes de E ou I — essa é a regra. GIRAFA é empolgante com figura ou brinquedo. FEIJÃO ela conhece da comida — ótima âncora."),
+    (27,27):("Cedilha Ç", "Símbolo novo: Ç — sempre soa como S, nunca como K. Palavras: MAÇÃ, POÇO, AÇAÍ, FAÇO. MAÇÃ é perfeita — segure uma maçã de verdade. AÇAÍ ela provavelmente adora. A cedilha (o gancho embaixo do C) é o sinal: 'este C faz som de S.' Aponte para o gancho cada vez."),
+    (28,28):("Vogais nasais: ÃO, EM, IM", "Sons novos: vogais nasais — ar sai pelo nariz E pela boca. Palavras: MÃO, PÃO, BEM, SIM, TAMBÉM. Segure a mão dela e diga MÃO DA MÃE — físico e lindo. PÃO com pão de verdade é o melhor apoio. SIM e BEM são pequeninhos mas poderosos — ela usa todo dia. Zumba o som nasal: mmm-ÃO."),
+    (29,29):("Vogais nasais: OM, UM, AN", "Mais vogais nasais. Palavras: BOM, SOM, UM, CANTO, TANTO. BOM DIA! — comece cada sessão a partir de agora com essa frase escrita num cartão. Ela fala toda manhã, agora pode ler. SOM é divertido — faça um som e pergunte 'que SOM é esse?' UM é o número um — contem coisas juntos."),
+    (30,30):("Revisão de todos os dígrafos", "Sem conteúdo novo. Revisão completa: LH NH CH X J/G-suave Ç e todas as vogais nasais. Jogue assim: ela escolhe um cartão virado para baixo, vira, lê. Cada acerto ganha um adesivo ou um high five. Anote quais dígrafos ela ainda hesita — esses recebem atenção extra antes do Estágio 2."),
+    (31,31):("Letras minúsculas — parte 1", "Mesmas palavras, agora em minúsculo: mãe, pai, bola, gato, sapo, cama. Mostre as duas versões lado a lado: MÃE / mãe. Diga: 'mesma palavra, roupa diferente.' Comece apenas com as palavras que ela conhece melhor em maiúsculo. NÃO apresse — essa é uma virada conceitual e precisa de paciência."),
+    (32,32):("Letras minúsculas + Leitura livre", "Última lição do Estágio 1. Mais minúsculas: filho, banho, chuva, maçã, girafa, leão. Depois leia um livro ilustrado brasileiro juntos — qualquer Ziraldo, A Bolsa Amarela, ou Palavra de Honra. Aponte para as palavras ao ler. Ela completou o Estágio 1. Ela está lendo. Parabéns para os dois — isso exigiu dedicação de verdade."),
+}
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def get_lesson_info(lang: str, num: int) -> tuple[str, str]:
+    """Returns (label, tips) for a lesson. Tips language matches lang."""
+    data = CLR_EN_LESSONS if lang == "en" else CLR_PT_LESSONS
+    for (start, end), (title, tips) in data.items():
+        if start <= num <= end:
+            label = f"📚 *{'English CLR' if lang == 'en' else 'Português — Fonética'} — {'Lesson' if lang == 'en' else 'Lição'} {num}: {title}*"
+            return label, tips
+    return "❌", f"{'Lesson' if lang == 'en' else 'Lição'} {num} not found. Valid range: 1–32."
+
+
+def ask_claude(user_message: str, system: str = None) -> str:
+    if system is None:
+        system = SYSTEM_EN
+    response = claude.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1000,
+        system=system,
+        messages=[{"role": "user", "content": user_message}],
+    )
+    return response.content[0].text
+
+
+async def transcribe_voice(file_bytes: bytes) -> str:
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if not openai_key:
+        return "[Voice not set up — add OPENAI_API_KEY to .env]"
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {openai_key}"},
+            files={"file": ("voice.ogg", file_bytes, "audio/ogg")},
+            data={"model": "whisper-1"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json().get("text", "")
+
+
+async def deliver_lesson(send_fn, lang: str, num: int, mark_done: bool = False) -> None:
+    """Fetch lesson info + Claude enrichment and send to user."""
+    label, tips = get_lesson_info(lang, num)
+    system = SYSTEM_PT if lang == "pt" else SYSTEM_EN
+
+    if lang == "pt":
+        prompt = (
+            f"Vou fazer essa lição de fonética com minha filha de 2 anos agora. "
+            f"Me dê 2–3 dicas práticas extras para fazer em casa. Curto e direto. Em português.\n\n"
+            f"{label}\n\n{tips}"
+        )
+    else:
+        prompt = (
+            f"I am about to do this phonics lesson with my 2-year-old daughter. "
+            f"Give me 2–3 extra practical tips for doing this at home. Short and actionable. English only.\n\n"
+            f"{label}\n\n{tips}"
+        )
+
+    enriched = ask_claude(prompt, system=system)
+
+    progress = load_progress()
+    done_emoji = "✅" if num < progress.get(lang, 1) else "▶️"
+    next_num = min(num + 1, 32)
+
+    # Done button + next lesson button
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"✅ {'Mark done' if lang == 'en' else 'Marcar como feita'}",
+                callback_data=f"done_{lang}_{num}"
+            ),
+            InlineKeyboardButton(
+                f"➡️ {'Next' if lang == 'en' else 'Próxima'} ({next_num})",
+                callback_data=f"lesson_{lang}_{next_num}"
+            ),
+        ]
+    ])
+
+    await send_fn(f"{label}\n\n{tips}", parse_mode="Markdown")
+    await send_fn(
+        f"{'💡 *Extra tips:*' if lang == 'en' else '💡 *Dicas extras:*'}\n\n{enriched}",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+    if mark_done:
+        mark_lesson_done(lang, num)
+
+
+# ── Command handlers ──────────────────────────────────────────────────────────
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    # Use HTML here — MarkdownV2 rejected this text before (unescaped ! and . inside *bold*).
+    await update.message.reply_text(
+        "👋 <b>Hello!</b> I'm your English and phonics assistant.\n\n"
+        "💬 Chat freely — any language, I always reply in English\n"
+        "📅 Daily English tip every morning\n"
+        "🎙️ Voice messages supported\n\n"
+        f"Your chat ID: <code>{chat_id}</code> — add to .env as YOUR_CHAT_ID\n\n"
+        "A pinned quick-menu has been set at the top of this chat 📌",
+        parse_mode="HTML",
+    )
+
+    # Send and pin the quick-access menu
+    menu_keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🇬🇧 English Course",    callback_data="course_en"),
+            InlineKeyboardButton("🇧🇷 Curso Português",   callback_data="course_pt"),
+        ],
+        [
+            InlineKeyboardButton("⏭️ Next EN lesson",     callback_data="next_en"),
+            InlineKeyboardButton("⏭️ Próxima PT lição",   callback_data="next_pt"),
+        ],
+        [
+            InlineKeyboardButton("💡 Tip of the day",     callback_data="quick_tip"),
+            InlineKeyboardButton("📖 Reading tips",       callback_data="quick_reading"),
+        ],
+    ])
+    pinned = await context.bot.send_message(
+        chat_id=chat_id,
+        text="📌 *Quick Menu* — tap anything to start:",
+        parse_mode="Markdown",
+        reply_markup=menu_keyboard,
+    )
+    # Pin it (disable notification so it doesn't spam)
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=chat_id,
+            message_id=pinned.message_id,
+            disable_notification=True,
+        )
+    except TelegramError as e:
+        logger.warning("Could not pin quick menu (you still have the menu above): %s", e)
+
+
+async def course_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show course selection buttons."""
+    progress = load_progress()
+    en_next = progress.get("en", 1)
+    pt_next = progress.get("pt", 1)
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"🇬🇧 English CLR (lesson {en_next}/32)",
+                callback_data=f"course_en"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"🇧🇷 Português — Fonética (lição {pt_next}/32)",
+                callback_data=f"course_pt"
+            ),
+        ],
+    ])
+    await update.message.reply_text(
+        "📚 *Which course?*\nTap to see the lesson menu:",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
+async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/next en  or  /next pt"""
+    args = context.args
+    if not args or args[0].lower() not in ("en", "pt"):
+        await update.message.reply_text(
+            "Use `/next en` for English or `/next pt` for Portuguese.",
+            parse_mode="Markdown",
+        )
+        return
+    lang = args[0].lower()
+    num = get_next_lesson(lang)
+    if num > 32:
+        msg = "🎉 You've completed all 32 lessons! Well done!" if lang == "en" else "🎉 Você completou todas as 32 lições! Parabéns!"
+        await update.message.reply_text(msg)
+        return
+    send = update.message.reply_text
+    await deliver_lesson(send, lang, num)
+
+
+async def lesson_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/lesson en 14  or  /lesson pt 7"""
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage:\n`/lesson en 14` — English lesson 14\n`/lesson pt 7` — Portuguese lesson 7",
+            parse_mode="Markdown",
+        )
+        return
+    lang = args[0].lower()
+    if lang not in ("en", "pt"):
+        await update.message.reply_text("Use `en` or `pt`. Example: `/lesson en 14`", parse_mode="Markdown")
+        return
+    try:
+        num = int(args[1])
+    except ValueError:
+        await update.message.reply_text("Please give a lesson number. Example: `/lesson pt 7`", parse_mode="Markdown")
+        return
+    if not 1 <= num <= 32:
+        await update.message.reply_text("Lesson number must be between 1 and 32.")
+        return
+
+    send = update.message.reply_text
+    await deliver_lesson(send, lang, num)
+
+
+async def tip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("✨ Getting your tip...")
+    tip = ask_claude(DAILY_TIP_PROMPT, system=SYSTEM_EN)
+    await update.message.reply_text(tip, parse_mode="Markdown")
+
+
+async def reading_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("📚 Getting reading tips...")
+    advice = ask_claude(
+        "Give practical early reading guidance for a 2-year-3-month-old child. "
+        "The parent is Brazilian, teaching both English and Portuguese phonics. "
+        "Cover: realistic expectations at this age, one activity to start this week, "
+        "one phonics tip, and one free YouTube read-aloud book recommendation. "
+        "English only. Be encouraging and brief.",
+        system=SYSTEM_EN,
+    )
+    await update.message.reply_text(advice, parse_mode="Markdown")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "🤖 *Commands:*\n\n"
+        "📚 /course — pick a course with buttons\n"
+        "⏭️ /next en — next English lesson\n"
+        "⏭️ /next pt — next Portuguese lesson\n"
+        "📖 /lesson en 14 — specific English lesson\n"
+        "📖 /lesson pt 7 — specific Portuguese lesson\n"
+        "💡 /tip — word of the day\n"
+        "📖 /reading — literacy guidance\n"
+        "❓ /help — this menu\n\n"
+        "Or send any text or voice message!",
+        parse_mode="Markdown",
+    )
+
+
+# ── Callback query handler (button taps) ─────────────────────────────────────
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    send = query.message.reply_text
+
+    # Course selection → show lesson menu
+    if data.startswith("course_"):
+        lang = data.split("_")[1]
+        progress = load_progress()
+        current = progress.get(lang, 1)
+        label = "🇬🇧 English CLR" if lang == "en" else "🇧🇷 Português — Fonética"
+        word = "Lesson" if lang == "en" else "Lição"
+
+        # Build a grid of lesson buttons (8 per row × 4 rows)
+        buttons = []
+        row = []
+        for n in range(1, 33):
+            done = "✅" if n < current else ("▶️" if n == current else f"{n}")
+            row.append(InlineKeyboardButton(done, callback_data=f"lesson_{lang}_{n}"))
+            if len(row) == 8:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+
+        await send(
+            f"{label}\n\nYour progress: {word} {current}/32\n\nTap a lesson to open it:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    # Lesson tap from menu
+    elif data.startswith("lesson_"):
+        _, lang, num_str = data.split("_")
+        num = int(num_str)
+        await deliver_lesson(send, lang, num)
+
+    # Mark lesson as done
+    elif data.startswith("done_"):
+        _, lang, num_str = data.split("_")
+        num = int(num_str)
+        mark_lesson_done(lang, num)
+        next_num = min(num + 1, 32)
+        word = "Lesson" if lang == "en" else "Lição"
+        msg = (
+            f"✅ {word} {num} marked as done! Your next lesson is {word} {next_num}.\n"
+            f"Use /next {'en' if lang == 'en' else 'pt'} when you're ready."
+            if lang == "en" else
+            f"✅ Lição {num} marcada como feita! Sua próxima lição é a Lição {next_num}.\n"
+            f"Use /next pt quando estiver pronta."
+        )
+        await send(msg)
+
+    # Pinned menu: next lesson shortcuts
+    elif data in ("next_en", "next_pt"):
+        lang = data.split("_")[1]
+        num = get_next_lesson(lang)
+        if num > 32:
+            msg = "🎉 You've completed all 32 lessons!" if lang == "en" else "🎉 Você completou todas as 32 lições!"
+            await send(msg)
+        else:
+            await deliver_lesson(send, lang, num)
+
+    # Pinned menu: quick tip
+    elif data == "quick_tip":
+        await send("✨ Getting your tip of the day...")
+        tip = ask_claude(DAILY_TIP_PROMPT, system=SYSTEM_EN)
+        await send(tip, parse_mode="Markdown")
+
+    # Pinned menu: reading tips
+    elif data == "quick_reading":
+        await send("📚 Getting reading tips...")
+        advice = ask_claude(
+            "Give practical early reading guidance for a 2-year-3-month-old child. "
+            "The parent is Brazilian, teaching both English and Portuguese phonics. "
+            "Cover: realistic expectations at this age, one activity to start this week, "
+            "one phonics tip, and one free YouTube read-aloud book recommendation. "
+            "English only. Be encouraging and brief.",
+            system=SYSTEM_EN,
+        )
+        await send(advice, parse_mode="Markdown")
+
+
+# ── Text + voice handlers ─────────────────────────────────────────────────────
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    reply = ask_claude(update.message.text, system=SYSTEM_EN)
+    await update.message.reply_text(reply, parse_mode="Markdown")
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("🎙️ Transcribing...")
+    tg_file = await context.bot.get_file(update.message.voice.file_id)
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+        await tg_file.download_to_drive(tmp.name)
+        with open(tmp.name, "rb") as f:
+            file_bytes = f.read()
+    transcript = await transcribe_voice(file_bytes)
+    if transcript.startswith("["):
+        await update.message.reply_text(transcript)
+        return
+    await update.message.reply_text(f'🗣️ *You said:* "{transcript}"', parse_mode="Markdown")
+    reply = ask_claude(f"The user said (via voice): {transcript}", system=SYSTEM_EN)
+    await update.message.reply_text(reply, parse_mode="Markdown")
+
+
+# ── Daily tip ─────────────────────────────────────────────────────────────────
+
+async def send_daily_tip(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not YOUR_CHAT_ID:
+        return
+    tip = ask_claude(DAILY_TIP_PROMPT, system=SYSTEM_EN)
+    await context.bot.send_message(chat_id=YOUR_CHAT_ID, text=tip, parse_mode="Markdown")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start",   start))
+    app.add_handler(CommandHandler("course",  course_command))
+    app.add_handler(CommandHandler("next",    next_command))
+    app.add_handler(CommandHandler("lesson",  lesson_command))
+    app.add_handler(CommandHandler("tip",     tip_command))
+    app.add_handler(CommandHandler("reading", reading_command))
+    app.add_handler(CommandHandler("help",    help_command))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+
+    if YOUR_CHAT_ID:
+        app.job_queue.run_daily(
+            send_daily_tip,
+            time=time(hour=DAILY_TIP_HOUR, minute=DAILY_TIP_MINUTE),
+            chat_id=YOUR_CHAT_ID,
+        )
+        logger.info(f"Daily tip scheduled at {DAILY_TIP_HOUR:02d}:{DAILY_TIP_MINUTE:02d}")
+
+    logger.info("Bot running...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()

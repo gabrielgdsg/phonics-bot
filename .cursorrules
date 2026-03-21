@@ -1,0 +1,52 @@
+# Phonics Bot — Cursor Rules
+# These instructions apply to every conversation in this project.
+
+## Project summary
+This is a Telegram bot for a Brazilian parent learning English and teaching phonics
+to a 2-year-old daughter. It uses:
+- python-telegram-bot for Telegram integration
+- Anthropic Claude API (claude-sonnet-4-20250514) as the AI brain
+- OpenAI Whisper API for optional voice transcription
+- A local progress.json file to track lesson progress
+
+All bot logic lives in a single file: bot.py. Do not split it.
+
+## What you should do automatically (without asking me)
+
+- After any change to requirements.txt, run: pip install -r requirements.txt
+- If .env does not exist but .env.example does, create .env from .env.example
+- After making code changes, always check for syntax errors before saying you're done
+- If the bot crashes with an error, read the traceback, fix it, and try again
+- If a package is missing, install it and continue
+- Always run python bot.py to verify the bot starts without errors after changes
+
+## How to run the bot
+    pip install -r requirements.txt
+    python bot.py
+
+## Things only the human can do (always remind me at the end)
+- Get the Telegram bot token from @BotFather on Telegram
+- Get the Anthropic API key from https://console.anthropic.com
+- Get YOUR_CHAT_ID by running the bot and sending /start (it shows the ID)
+- Optionally get an OpenAI API key from https://platform.openai.com for voice support
+
+## At the end of every task, always tell me:
+1. What you changed
+2. What I still need to do manually
+3. What the next step is
+
+## Code style
+- Python 3.11+
+- Async/await throughout (python-telegram-bot v21)
+- Keep all code in bot.py
+- Use clear section comments (# ── Section name ───)
+- No type stubs needed, keep it simple and readable
+
+## Key files
+- bot.py           — all bot logic
+- requirements.txt — Python dependencies
+- .env             — secrets (never commit this)
+- .env.example     — template for .env (safe to commit)
+- progress.json    — auto-created at runtime, tracks lesson progress
+- SETUP_GUIDE.md   — human-readable setup instructions
+- fonetismo_portugues_estagio1.pdf — Portuguese phonics flashcards (print this)
