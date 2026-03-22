@@ -82,6 +82,7 @@ Tell me clearly:
    OPENAI_API_KEY        = (optional — voice + /falar; leave empty if not set up)
 
    No chat IDs in Railway — each user is registered when they send /start (stored in progress.json).
+   progress.json and cache.json (lesson pre-cache) reset on redeploy unless you add a Railway volume.
 
 6. After adding variables, click "Deploy" or it may deploy automatically
 7. Go to the "Logs" tab and watch for the line: "Bot running..."

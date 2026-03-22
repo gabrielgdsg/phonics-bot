@@ -83,7 +83,6 @@ def load_data() -> dict:
             raw = None
         else:
             if isinstance(raw, dict) and "lessons" not in raw and ("en" in raw or "pt" in raw):
-                # Legacy progress.json: {"en": n, "pt": n} → nested lessons + users
                 raw = {
                     "lessons": {
                         "en": int(raw.get("en", 1)),
@@ -126,6 +125,97 @@ def set_user_config(chat_id: int, key: str, value) -> None:
 def get_all_user_ids() -> list[int]:
     """Return all registered chat IDs."""
     return [int(uid) for uid in load_data().get("users", {}).keys()]
+
+
+# ── Cache system ──────────────────────────────────────────────────────────────
+# cache.json stores:
+# {
+#   "lessons": {
+#     "en_1": "extra tips text...",
+#     "pt_7": "extra tips text...",
+#     ...all 64 lessons, generated once ever
+#   },
+#   "semana": {
+#     "week": "2024-W03",         # ISO week string
+#     "plan": "Monday...",        # the full plan text
+#   }
+# }
+
+CACHE_FILE = Path("cache.json")
+
+def load_cache() -> dict:
+    if CACHE_FILE.exists():
+        try:
+            return json.loads(CACHE_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+def save_cache(cache: dict) -> None:
+    CACHE_FILE.write_text(json.dumps(cache, indent=2))
+
+def get_cached_lesson(lang: str, num: int) -> str | None:
+    return load_cache().get("lessons", {}).get(f"{lang}_{num}")
+
+def set_cached_lesson(lang: str, num: int, text: str) -> None:
+    cache = load_cache()
+    cache.setdefault("lessons", {})[f"{lang}_{num}"] = text
+    save_cache(cache)
+
+def get_cached_semana() -> str | None:
+    """Return cached weekly plan if it's from the current ISO week."""
+    cache = load_cache()
+    semana = cache.get("semana", {})
+    current_week = date.today().strftime("%G-W%V")
+    if semana.get("week") == current_week:
+        return semana.get("plan")
+    return None
+
+def set_cached_semana(plan: str) -> None:
+    cache = load_cache()
+    cache["semana"] = {
+        "week": date.today().strftime("%G-W%V"),
+        "plan": plan,
+    }
+    save_cache(cache)
+
+def lessons_cache_complete() -> bool:
+    """True if all 64 lessons are already cached."""
+    cached = load_cache().get("lessons", {})
+    return all(f"{lang}_{n}" in cached for lang in ("en", "pt") for n in range(1, 33))
+
+async def prewarm_lessons_cache() -> None:
+    """Background task: generate and cache all 64 lesson enrichments if not done yet."""
+    if lessons_cache_complete():
+        logger.info("Lesson cache already complete — skipping pre-warm.")
+        return
+
+    logger.info("Pre-warming lesson cache (64 lessons)... this runs once ever.")
+    count = 0
+    for lang in ("en", "pt"):
+        system = SYSTEM_PT if lang == "pt" else SYSTEM_EN
+        for num in range(1, 33):
+            if get_cached_lesson(lang, num):
+                continue  # already cached
+            label, tips = get_lesson_info(lang, num)
+            if lang == "pt":
+                prompt = (
+                    f"Vou fazer essa lição de fonética com minha filha de 2 anos agora. "
+                    f"Me dê 2–3 dicas práticas extras para fazer em casa. Curto e direto. Em português.\n\n"
+                    f"{label}\n\n{tips}"
+                )
+            else:
+                prompt = (
+                    f"I am about to do this phonics lesson with my 2-year-old daughter. "
+                    f"Give me 2–3 extra practical tips for doing this at home. Short and actionable. English only.\n\n"
+                    f"{label}\n\n{tips}"
+                )
+            enriched = ask_claude(prompt, system=system)
+            set_cached_lesson(lang, num, enriched)
+            count += 1
+            logger.info(f"Cached {lang} lesson {num} ({count}/64)")
+
+    logger.info("Lesson cache pre-warm complete — all 64 lessons cached forever.")
 
 def get_next_lesson(lang: str) -> int:
     return load_data().get("lessons", {}).get(lang, 1)
@@ -415,24 +505,29 @@ async def text_to_speech(text: str) -> bytes | None:
 
 
 async def deliver_lesson(send_fn, lang: str, num: int, mark_done: bool = False) -> None:
-    """Fetch lesson info + Claude enrichment and send to user."""
+    """Fetch lesson info + enrichment (from cache if available) and send to user."""
     label, tips = get_lesson_info(lang, num)
     system = SYSTEM_PT if lang == "pt" else SYSTEM_EN
 
-    if lang == "pt":
-        prompt = (
-            f"Vou fazer essa lição de fonética com minha filha de 2 anos agora. "
-            f"Me dê 2–3 dicas práticas extras para fazer em casa. Curto e direto. Em português.\n\n"
-            f"{label}\n\n{tips}"
-        )
-    else:
-        prompt = (
-            f"I am about to do this phonics lesson with my 2-year-old daughter. "
-            f"Give me 2–3 extra practical tips for doing this at home. Short and actionable. English only.\n\n"
-            f"{label}\n\n{tips}"
-        )
-
-    enriched = ask_claude(prompt, system=system)
+    # Try cache first — instant and free
+    enriched = get_cached_lesson(lang, num)
+    if not enriched:
+        # Cache miss — generate and store for next time
+        if lang == "pt":
+            prompt = (
+                f"Vou fazer essa lição de fonética com minha filha de 2 anos agora. "
+                f"Me dê 2–3 dicas práticas extras para fazer em casa. Curto e direto. Em português.\n\n"
+                f"{label}\n\n{tips}"
+            )
+        else:
+            prompt = (
+                f"I am about to do this phonics lesson with my 2-year-old daughter. "
+                f"Give me 2–3 extra practical tips for doing this at home. Short and actionable. English only.\n\n"
+                f"{label}\n\n{tips}"
+            )
+        enriched = ask_claude(prompt, system=system)
+        set_cached_lesson(lang, num, enriched)
+        logger.info(f"Lesson {lang}_{num} generated and cached.")
 
     progress = load_progress()
     done_emoji = "✅" if num < progress.get(lang, 1) else "▶️"
@@ -735,8 +830,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # Pinned menu: weekly plan
     elif data == "quick_semana":
-        await send("📅 Criando o plano da semana... aguarde!")
-        plan = ask_claude(WEEKLY_PLAN_PROMPT, system=SYSTEM_ACTIVITIES_PT)
+        plan = get_cached_semana()
+        if not plan:
+            await send("📅 Criando o plano da semana... aguarde!")
+            plan = ask_claude(WEEKLY_PLAN_PROMPT, system=SYSTEM_ACTIVITIES_PT)
+            set_cached_semana(plan)
         if len(plan) > 4000:
             mid = plan.find("━━━", 2000)
             if mid == -1:
@@ -916,11 +1014,14 @@ async def atividade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def semana_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/semana — full weekly activity plan in Portuguese with printout bundle."""
-    await update.message.reply_text(
-        "📅 Criando o plano da semana... isso pode levar alguns segundos!"
-    )
-    plan = ask_claude(WEEKLY_PLAN_PROMPT, system=SYSTEM_ACTIVITIES_PT)
+    """/semana — full weekly activity plan, cached per ISO week."""
+    plan = get_cached_semana()
+    if plan:
+        await update.message.reply_text("📅 *Plano da semana* _(do cache — sem custo extra)_", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("📅 Criando o plano da semana... isso pode levar alguns segundos!")
+        plan = ask_claude(WEEKLY_PLAN_PROMPT, system=SYSTEM_ACTIVITIES_PT)
+        set_cached_semana(plan)
 
     # Split if too long for one message
     if len(plan) > 4000:
@@ -1006,6 +1107,12 @@ def main() -> None:
         time=time(hour=DAILY_TIP_HOUR, minute=DAILY_TIP_MINUTE),
     )
     logger.info(f"Daily messages scheduled at {DAILY_TIP_HOUR:02d}:{DAILY_TIP_MINUTE:02d}")
+
+    # Pre-warm lesson cache in background — runs once ever, 30s after startup
+    async def prewarm_job(ctx):
+        await prewarm_lessons_cache()
+
+    app.job_queue.run_once(prewarm_job, when=30)
 
     logger.info("Bot running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
