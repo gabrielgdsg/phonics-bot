@@ -47,10 +47,6 @@ TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 DAILY_TIP_HOUR    = int(os.getenv("DAILY_TIP_HOUR", "11"))
 DAILY_TIP_MINUTE  = int(os.getenv("DAILY_TIP_MINUTE", "0"))
-# CHAT_ID_EN / CHAT_ID_PT: see .env.example. YOUR_CHAT_ID still fills CHAT_ID_EN if unset (Railway migration).
-_legacy_chat_id = int(os.getenv("YOUR_CHAT_ID", "0"))
-CHAT_ID_EN        = int(os.getenv("CHAT_ID_EN", "0")) or _legacy_chat_id
-CHAT_ID_PT        = int(os.getenv("CHAT_ID_PT", "0"))
 
 PROGRESS_FILE = Path("progress.json")
 
@@ -62,55 +58,74 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 #   "lessons": {"en": 1, "pt": 1},
 #   "users": {
 #     "123456789": {
-#       "lang": "en",            # default chat language
+#       "lang": "en",            # default chat language: "en" or "pt"
 #       "daily_tip": true,       # receive English tip daily
 #       "daily_activity": true,  # receive daily activity
 #       "activity_lang": "en",   # language for activities
-#     },
-#     "987654321": { ... }
+#     }
 #   }
 # }
+# Users are auto-registered when they send /start.
+# No chat IDs needed in .env — the bot learns who to message on its own.
 
-DEFAULT_CONFIG_EN = {
+DEFAULT_CONFIG = {
     "lang": "en",
     "daily_tip": True,
     "daily_activity": True,
     "activity_lang": "en",
 }
 
-DEFAULT_CONFIG_PT = {
-    "lang": "pt",
-    "daily_tip": True,       # English tip even for PT users (as requested)
-    "daily_activity": True,
-    "activity_lang": "pt",
-}
-
 def load_data() -> dict:
     if PROGRESS_FILE.exists():
         try:
-            return json.loads(PROGRESS_FILE.read_text())
+            raw = json.loads(PROGRESS_FILE.read_text())
         except Exception:
-            pass
+            raw = None
+        else:
+            if isinstance(raw, dict) and "lessons" not in raw and ("en" in raw or "pt" in raw):
+                # Legacy progress.json: {"en": n, "pt": n} → nested lessons + users
+                raw = {
+                    "lessons": {
+                        "en": int(raw.get("en", 1)),
+                        "pt": int(raw.get("pt", 1)),
+                    },
+                    "users": raw.get("users", {}),
+                }
+                save_data(raw)
+            if isinstance(raw, dict):
+                return raw
     return {"lessons": {"en": 1, "pt": 1}, "users": {}}
 
 def save_data(data: dict) -> None:
     PROGRESS_FILE.write_text(json.dumps(data, indent=2))
 
-def get_user_config(chat_id: int) -> dict:
+def register_user(chat_id: int) -> None:
+    """Auto-register a user with default config when they send /start."""
     data = load_data()
     uid = str(chat_id)
     if uid not in data.get("users", {}):
-        # Auto-detect defaults based on known chat IDs
-        default = DEFAULT_CONFIG_PT.copy() if chat_id == CHAT_ID_PT else DEFAULT_CONFIG_EN.copy()
-        data.setdefault("users", {})[uid] = default
+        data.setdefault("users", {})[uid] = DEFAULT_CONFIG.copy()
+        save_data(data)
+        logger.info(f"New user registered: {chat_id}")
+
+def get_user_config(chat_id: int) -> dict:
+    data = load_data()
+    uid = str(chat_id)
+    # Register on first access if not yet known
+    if uid not in data.get("users", {}):
+        data.setdefault("users", {})[uid] = DEFAULT_CONFIG.copy()
         save_data(data)
     return data["users"][uid]
 
 def set_user_config(chat_id: int, key: str, value) -> None:
     data = load_data()
     uid = str(chat_id)
-    data.setdefault("users", {}).setdefault(uid, DEFAULT_CONFIG_EN.copy())[key] = value
+    data.setdefault("users", {}).setdefault(uid, DEFAULT_CONFIG.copy())[key] = value
     save_data(data)
+
+def get_all_user_ids() -> list[int]:
+    """Return all registered chat IDs."""
+    return [int(uid) for uid in load_data().get("users", {}).keys()]
 
 def get_next_lesson(lang: str) -> int:
     return load_data().get("lessons", {}).get(lang, 1)
@@ -452,26 +467,26 @@ async def deliver_lesson(send_fn, lang: str, num: int, mark_done: bool = False) 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+    # Auto-register this user for daily messages
+    register_user(chat_id)
     is_pt = user_is_pt(chat_id)
 
-    # HTML — MarkdownV2 breaks on ! . etc. in *bold* welcome text.
     if is_pt:
         welcome = (
             "👋 <b>Olá!</b> Sou sua assistente de atividades e fonetismo.\n\n"
             "💬 Fale comigo à vontade — respondo sempre em português\n"
-            "📅 Atividade do dia toda manhã\n"
-            "🎙️ Mensagens de voz também funcionam\n\n"
-            f"Seu chat ID: <code>{chat_id}</code>\n\n"
+            "📅 Você receberá uma dica em inglês e uma atividade toda manhã\n"
+            "🎙️ Mensagens de voz também funcionam\n"
+            "⚙️ Use o menu de configurações para personalizar tudo\n\n"
             "Um menu rápido foi fixado no topo desta conversa 📌"
         )
     else:
         welcome = (
             "👋 <b>Hello!</b> I'm your English and phonics assistant.\n\n"
             "💬 Chat freely — I always reply in English\n"
-            "📅 Daily English tip + activity every morning\n"
-            "🎙️ Voice messages supported\n\n"
-            f"Your chat ID: <code>{chat_id}</code>\n"
-            "Add it to Railway as CHAT_ID_EN (you) or CHAT_ID_PT (wife)\n\n"
+            "📅 You'll get a daily English tip + activity every morning\n"
+            "🎙️ Voice messages supported\n"
+            "⚙️ Use the Settings menu to personalise everything\n\n"
             "A pinned quick-menu has been set at the top of this chat 📌"
         )
 
@@ -950,9 +965,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ── Daily messages ────────────────────────────────────────────────────────────
 
 async def send_daily_tip(context: ContextTypes.DEFAULT_TYPE) -> None:
-    for chat_id in [CHAT_ID_EN, CHAT_ID_PT]:
-        if not chat_id:
-            continue
+    for chat_id in get_all_user_ids():
         cfg = get_user_config(chat_id)
 
         # English tip — sent to everyone who has it enabled
@@ -987,12 +1000,12 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    if CHAT_ID_EN or CHAT_ID_PT:
-        app.job_queue.run_daily(
-            send_daily_tip,
-            time=time(hour=DAILY_TIP_HOUR, minute=DAILY_TIP_MINUTE),
-        )
-        logger.info(f"Daily messages scheduled at {DAILY_TIP_HOUR:02d}:{DAILY_TIP_MINUTE:02d}")
+    # Always schedule daily messages — sends to all registered users
+    app.job_queue.run_daily(
+        send_daily_tip,
+        time=time(hour=DAILY_TIP_HOUR, minute=DAILY_TIP_MINUTE),
+    )
+    logger.info(f"Daily messages scheduled at {DAILY_TIP_HOUR:02d}:{DAILY_TIP_MINUTE:02d}")
 
     logger.info("Bot running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
