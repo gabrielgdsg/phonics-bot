@@ -17,6 +17,7 @@ import os
 import json
 import logging
 import tempfile
+import re
 from datetime import time, date
 from pathlib import Path
 from dotenv import load_dotenv
@@ -33,6 +34,7 @@ from telegram.ext import (
 )
 import anthropic
 import httpx
+from usage_logger import log_usage, init_usage_table
 
 load_dotenv()
 
@@ -71,7 +73,8 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 DEFAULT_CONFIG = {
     "lang": "en",
     "daily_tip": True,
-    "daily_activity": True,
+    # Only the "tip of the day" is proactive; daily activity is generated only when the user asks.
+    "daily_activity": False,
     "activity_lang": "en",
 }
 
@@ -125,6 +128,93 @@ def set_user_config(chat_id: int, key: str, value) -> None:
 def get_all_user_ids() -> list[int]:
     """Return all registered chat IDs."""
     return [int(uid) for uid in load_data().get("users", {}).keys()]
+
+DAILY_TIP_HISTORY_LIMIT = 14
+
+def load_daily_tip_history() -> list[dict]:
+    """Return recent daily tip entries stored in progress.json."""
+    data = load_data()
+    hist = data.get("daily_tip_history", [])
+    if not isinstance(hist, list):
+        return []
+    out: list[dict] = []
+    for entry in hist:
+        if not isinstance(entry, dict):
+            continue
+        if not isinstance(entry.get("date"), str):
+            continue
+        tip = entry.get("tip")
+        if not isinstance(tip, str):
+            continue
+        expr = entry.get("expression")
+        if expr is not None and not isinstance(expr, str):
+            expr = None
+        out.append({"date": entry["date"], "expression": expr, "tip": tip})
+    return out
+
+def save_daily_tip_history(history: list[dict]) -> None:
+    data = load_data()
+    data["daily_tip_history"] = history[-DAILY_TIP_HISTORY_LIMIT:]
+    save_data(data)
+
+def extract_daily_tip_expression(tip_text: str) -> str | None:
+    """Extract the expression/word from the first 🌟 *...* line."""
+    # Typical format: 🌟 *All done*
+    m = re.search(r"🌟\\s*\\*([^*]+)\\*", tip_text)
+    if m:
+        expr = m.group(1).strip()
+        return expr or None
+
+    # Fallback: label line uses a generic star, expression is on the next line.
+    # Example:
+    # 🌟 *Word or Expression of the Day*
+    # all done
+    m2 = re.search(r"🌟\\s*\\*[^*]+\\*\\s*\\n\\s*([^\\n\\r]+)", tip_text)
+    if not m2:
+        return None
+    expr = m2.group(1).strip()
+    return expr or None
+
+def generate_daily_tip_with_history() -> str:
+    """Generate a daily tip, avoiding recent repetitions."""
+    today = date.today().isoformat()
+    history = load_daily_tip_history()
+
+    # If the job runs twice, reuse today's tip.
+    for entry in history:
+        if entry.get("date") == today and isinstance(entry.get("tip"), str):
+            return entry["tip"]
+
+    recent_expr = [e.get("expression") for e in history[-7:] if e.get("expression")]
+    avoid_list = ", ".join(recent_expr) if recent_expr else "none"
+
+    user_message = (
+        DAILY_TIP_PROMPT
+        + "\n"
+        + "Important: Do NOT repeat any expression from the last days: "
+        + f"{avoid_list}.\n"
+        + "Pick a different word/expression."
+    )
+
+    tip = ask_claude(user_message, system=SYSTEM_EN, temperature=0.9)
+    expr = extract_daily_tip_expression(tip)
+
+    # One retry if Claude still picked a recent expression.
+    if expr and expr in recent_expr:
+        user_message_retry = (
+            DAILY_TIP_PROMPT
+            + "\n"
+            + f"The previous pick was {expr}. Do NOT use it.\n"
+            + "Pick a different word/expression."
+        )
+        tip = ask_claude(user_message_retry, system=SYSTEM_EN, temperature=1.0)
+        expr = extract_daily_tip_expression(tip)
+
+    # Upsert today's entry.
+    history = [e for e in history if e.get("date") != today]
+    history.append({"date": today, "expression": expr, "tip": tip})
+    save_daily_tip_history(history)
+    return tip
 
 
 # ── Cache system ──────────────────────────────────────────────────────────────
@@ -452,15 +542,25 @@ def activity_prompt(chat_id: int) -> str:
     )
 
 
-def ask_claude(user_message: str, system: str = None) -> str:
+def ask_claude(
+    user_message: str,
+    system: str = None,
+    *,
+    temperature: float | None = None,
+) -> str:
     if system is None:
         system = SYSTEM_EN
-    response = claude.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1000,
-        system=system,
-        messages=[{"role": "user", "content": user_message}],
-    )
+    create_kwargs = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 1000,
+        "system": system,
+        "messages": [{"role": "user", "content": user_message}],
+    }
+    if temperature is not None:
+        create_kwargs["temperature"] = temperature
+
+    response = claude.messages.create(**create_kwargs)
+    log_usage("phonics-bot", response)
     return response.content[0].text
 
 
@@ -923,14 +1023,12 @@ def build_config_keyboard(chat_id: int) -> InlineKeyboardMarkup:
 
     lang_label    = f"💬 Chat: {'🇧🇷 Português' if is_pt else '🇬🇧 English'} — tap to switch"
     tip_label     = f"{tog(cfg.get('daily_tip', True))} Daily English tip"
-    act_label     = f"{tog(cfg.get('daily_activity', True))} Daily activity"
     act_lang      = cfg.get("activity_lang", "en")
     act_lang_lbl  = f"🎨 Activity language: {'🇧🇷 PT' if act_lang == 'pt' else '🇬🇧 EN'} — tap to switch"
 
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(lang_label,    callback_data="cfg_lang")],
         [InlineKeyboardButton(tip_label,     callback_data="cfg_tip")],
-        [InlineKeyboardButton(act_label,     callback_data="cfg_activity")],
         [InlineKeyboardButton(act_lang_lbl,  callback_data="cfg_actlang")],
     ])
 
@@ -1066,23 +1164,26 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ── Daily messages ────────────────────────────────────────────────────────────
 
 async def send_daily_tip(context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Proactive only: "tip of the day" (for all users who have daily_tip enabled).
+    # Daily activity is generated only when the user asks via /atividade or /atividades.
+    targets: list[int] = []
     for chat_id in get_all_user_ids():
         cfg = get_user_config(chat_id)
-
-        # English tip — sent to everyone who has it enabled
         if cfg.get("daily_tip", True):
-            tip = ask_claude(DAILY_TIP_PROMPT, system=SYSTEM_EN)
-            await context.bot.send_message(chat_id=chat_id, text=tip, parse_mode="Markdown")
+            targets.append(chat_id)
 
-        # Daily activity — language follows user's activity_lang config
-        if cfg.get("daily_activity", True):
-            act = ask_claude(activity_prompt(chat_id), system=activity_system(chat_id))
-            await context.bot.send_message(chat_id=chat_id, text=act, parse_mode="Markdown")
+    if not targets:
+        return
+
+    tip = generate_daily_tip_with_history()
+    for chat_id in targets:
+        await context.bot.send_message(chat_id=chat_id, text=tip, parse_mode="Markdown")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    init_usage_table()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start",      start))
