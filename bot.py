@@ -799,7 +799,7 @@ async def lesson_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def tip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("✨ Getting your tip...")
-    tip = ask_claude(DAILY_TIP_PROMPT, system=SYSTEM_EN)
+    tip = generate_daily_tip_with_history()
     await update.message.reply_text(tip, parse_mode="Markdown")
 
 
@@ -906,7 +906,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Pinned menu: quick tip
     elif data == "quick_tip":
         await send("✨ Getting your tip of the day...")
-        tip = ask_claude(DAILY_TIP_PROMPT, system=SYSTEM_EN)
+        tip = generate_daily_tip_with_history()
         await send(tip, parse_mode="Markdown")
 
     # Pinned menu: reading tips
