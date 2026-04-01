@@ -51,8 +51,75 @@ DAILY_TIP_HOUR    = int(os.getenv("DAILY_TIP_HOUR", "11"))
 DAILY_TIP_MINUTE  = int(os.getenv("DAILY_TIP_MINUTE", "0"))
 
 PROGRESS_FILE = Path("progress.json")
+CACHE_FILE = Path("cache.json")
+
+# Optional persistence in Railway Postgres (recommended over volumes).
+try:
+    import psycopg2  # type: ignore
+    from psycopg2.extras import RealDictCursor  # type: ignore
+except Exception:  # pragma: no cover
+    psycopg2 = None
+    RealDictCursor = None
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# ── Postgres KV storage (persists bot state across redeploys) ─────────────────
+
+def _db_url() -> str:
+    return os.getenv("DATABASE_URL", "").strip()
+
+def db_available() -> bool:
+    return bool(_db_url()) and psycopg2 is not None
+
+def get_db():
+    url = _db_url()
+    if not url:
+        raise RuntimeError("DATABASE_URL is not set")
+    # Railway often uses postgresql:// ; psycopg2 supports it, but keep compatibility with older forms.
+    url = url.replace("postgresql://", "postgres://", 1)
+    return psycopg2.connect(url, cursor_factory=RealDictCursor)
+
+def init_kv_table() -> None:
+    if not db_available():
+        return
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_kv (
+                    key TEXT PRIMARY KEY,
+                    value JSONB NOT NULL,
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+                """
+            )
+        conn.commit()
+
+def kv_get(key: str) -> dict | None:
+    if not db_available():
+        return None
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM bot_kv WHERE key = %s", (key,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            return row["value"]
+
+def kv_set(key: str, value: dict) -> None:
+    if not db_available():
+        raise RuntimeError("DB not available")
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bot_kv (key, value, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                """,
+                (key, json.dumps(value)),
+            )
+        conn.commit()
 
 # ── Per-user data (progress + config) ────────────────────────────────────────
 # Stored in progress.json as:
@@ -79,6 +146,11 @@ DEFAULT_CONFIG = {
 }
 
 def load_data() -> dict:
+    if db_available():
+        raw = kv_get("data")
+        if isinstance(raw, dict):
+            return raw
+
     if PROGRESS_FILE.exists():
         try:
             raw = json.loads(PROGRESS_FILE.read_text())
@@ -96,9 +168,13 @@ def load_data() -> dict:
                 save_data(raw)
             if isinstance(raw, dict):
                 return raw
+
     return {"lessons": {"en": 1, "pt": 1}, "users": {}}
 
 def save_data(data: dict) -> None:
+    if db_available():
+        kv_set("data", data)
+        return
     PROGRESS_FILE.write_text(json.dumps(data, indent=2))
 
 def register_user(chat_id: int) -> None:
@@ -243,9 +319,12 @@ def generate_daily_tip_with_history() -> str:
 #   }
 # }
 
-CACHE_FILE = Path("cache.json")
-
 def load_cache() -> dict:
+    if db_available():
+        raw = kv_get("cache")
+        if isinstance(raw, dict):
+            return raw
+
     if CACHE_FILE.exists():
         try:
             return json.loads(CACHE_FILE.read_text())
@@ -254,6 +333,9 @@ def load_cache() -> dict:
     return {}
 
 def save_cache(cache: dict) -> None:
+    if db_available():
+        kv_set("cache", cache)
+        return
     CACHE_FILE.write_text(json.dumps(cache, indent=2))
 
 def get_cached_lesson(lang: str, num: int) -> str | None:
@@ -1196,6 +1278,7 @@ async def send_daily_tip(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def main() -> None:
     init_usage_table()
+    init_kv_table()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start",      start))
