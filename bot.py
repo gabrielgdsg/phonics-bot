@@ -77,49 +77,61 @@ def get_db():
         raise RuntimeError("DATABASE_URL is not set")
     # Railway often uses postgresql:// ; psycopg2 supports it, but keep compatibility with older forms.
     url = url.replace("postgresql://", "postgres://", 1)
-    return psycopg2.connect(url, cursor_factory=RealDictCursor)
+    # Prevent hangs if Postgres is temporarily unreachable.
+    return psycopg2.connect(url, cursor_factory=RealDictCursor, connect_timeout=5)
 
 def init_kv_table() -> None:
     if not db_available():
         return
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS bot_kv (
-                    key TEXT PRIMARY KEY,
-                    value JSONB NOT NULL,
-                    updated_at TIMESTAMP DEFAULT NOW()
-                );
-                """
-            )
-        conn.commit()
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bot_kv (
+                        key TEXT PRIMARY KEY,
+                        value JSONB NOT NULL,
+                        updated_at TIMESTAMP DEFAULT NOW()
+                    );
+                    """
+                )
+            conn.commit()
+    except Exception as e:
+        logger.warning("Postgres KV init failed; falling back to local files: %s", e)
 
 def kv_get(key: str) -> dict | None:
     if not db_available():
         return None
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT value FROM bot_kv WHERE key = %s", (key,))
-            row = cur.fetchone()
-            if not row:
-                return None
-            return row["value"]
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM bot_kv WHERE key = %s", (key,))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                return row["value"]
+    except Exception as e:
+        logger.warning("Postgres KV read failed; falling back to local files: %s", e)
+        return None
 
 def kv_set(key: str, value: dict) -> None:
     if not db_available():
         raise RuntimeError("DB not available")
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO bot_kv (key, value, updated_at)
-                VALUES (%s, %s, NOW())
-                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
-                """,
-                (key, json.dumps(value)),
-            )
-        conn.commit()
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO bot_kv (key, value, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                    """,
+                    (key, json.dumps(value)),
+                )
+            conn.commit()
+    except Exception as e:
+        # Don't break the bot if Postgres is down.
+        logger.warning("Postgres KV write failed; falling back to local files: %s", e)
 
 # ── Per-user data (progress + config) ────────────────────────────────────────
 # Stored in progress.json as:
@@ -1273,6 +1285,9 @@ async def send_daily_tip(context: ContextTypes.DEFAULT_TYPE) -> None:
     for chat_id in targets:
         await context.bot.send_message(chat_id=chat_id, text=tip, parse_mode="Markdown")
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled error while processing update", exc_info=context.error)
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -1296,6 +1311,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_error_handler(on_error)
 
     # Always schedule daily messages — sends to all registered users
     app.job_queue.run_daily(

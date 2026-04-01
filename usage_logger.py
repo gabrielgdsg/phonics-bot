@@ -28,7 +28,8 @@ def get_db():
     if not url:
         raise RuntimeError("DATABASE_URL is not set")
     url = url.replace("postgresql://", "postgres://", 1)
-    return psycopg2.connect(url, cursor_factory=RealDictCursor)
+    # Prevent hangs if Postgres is temporarily unreachable.
+    return psycopg2.connect(url, cursor_factory=RealDictCursor, connect_timeout=5)
 
 def init_usage_table():
     """Create usage_log table if it doesn't exist."""
