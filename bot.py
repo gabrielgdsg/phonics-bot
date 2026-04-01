@@ -149,7 +149,12 @@ def load_daily_tip_history() -> list[dict]:
         expr = entry.get("expression")
         if expr is not None and not isinstance(expr, str):
             expr = None
-        out.append({"date": entry["date"], "expression": expr, "tip": tip})
+        expr_norm = entry.get("expression_norm")
+        if expr_norm is not None and not isinstance(expr_norm, str):
+            expr_norm = None
+        if expr and not expr_norm:
+            expr_norm = expr.casefold()
+        out.append({"date": entry["date"], "expression": expr, "expression_norm": expr_norm, "tip": tip})
     return out
 
 def save_daily_tip_history(history: list[dict]) -> None:
@@ -185,8 +190,13 @@ def generate_daily_tip_with_history() -> str:
         if entry.get("date") == today and isinstance(entry.get("tip"), str):
             return entry["tip"]
 
-    recent_expr = [e.get("expression") for e in history[-7:] if e.get("expression")]
-    avoid_list = ", ".join(recent_expr) if recent_expr else "none"
+    recent_expr_norm = [
+        e.get("expression_norm") or (e.get("expression").casefold() if e.get("expression") else None)
+        for e in history[-7:]
+    ]
+    recent_expr_norm = [x for x in recent_expr_norm if x]
+    recent_expr_display = [e.get("expression") for e in history[-7:] if e.get("expression")]
+    avoid_list = ", ".join(recent_expr_display) if recent_expr_display else "none"
 
     user_message = (
         DAILY_TIP_PROMPT
@@ -198,9 +208,10 @@ def generate_daily_tip_with_history() -> str:
 
     tip = ask_claude(user_message, system=SYSTEM_EN, temperature=0.9)
     expr = extract_daily_tip_expression(tip)
+    expr_norm = expr.casefold() if expr else None
 
     # One retry if Claude still picked a recent expression.
-    if expr and expr in recent_expr:
+    if expr_norm and expr_norm in recent_expr_norm:
         user_message_retry = (
             DAILY_TIP_PROMPT
             + "\n"
@@ -209,10 +220,11 @@ def generate_daily_tip_with_history() -> str:
         )
         tip = ask_claude(user_message_retry, system=SYSTEM_EN, temperature=1.0)
         expr = extract_daily_tip_expression(tip)
+        expr_norm = expr.casefold() if expr else None
 
     # Upsert today's entry.
     history = [e for e in history if e.get("date") != today]
-    history.append({"date": today, "expression": expr, "tip": tip})
+    history.append({"date": today, "expression": expr, "expression_norm": expr_norm, "tip": tip})
     save_daily_tip_history(history)
     return tip
 
