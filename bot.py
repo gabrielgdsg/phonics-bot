@@ -49,6 +49,7 @@ TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 DAILY_TIP_HOUR    = int(os.getenv("DAILY_TIP_HOUR", "11"))
 DAILY_TIP_MINUTE  = int(os.getenv("DAILY_TIP_MINUTE", "0"))
+PREWARM_LESSON_CACHE = os.getenv("PREWARM_LESSON_CACHE", "0").strip().lower() in ("1", "true", "yes", "on")
 
 PROGRESS_FILE = Path("progress.json")
 CACHE_FILE = Path("cache.json")
@@ -1320,11 +1321,15 @@ def main() -> None:
     )
     logger.info(f"Daily messages scheduled at {DAILY_TIP_HOUR:02d}:{DAILY_TIP_MINUTE:02d}")
 
-    # Pre-warm lesson cache in background — runs once ever, 30s after startup
-    async def prewarm_job(ctx):
-        await prewarm_lessons_cache()
+    # Optional: Pre-warm lesson cache in background (can trigger up to 64 Claude calls).
+    if PREWARM_LESSON_CACHE:
+        async def prewarm_job(ctx):
+            await prewarm_lessons_cache()
 
-    app.job_queue.run_once(prewarm_job, when=30)
+        app.job_queue.run_once(prewarm_job, when=30)
+        logger.info("Lesson cache pre-warm enabled (PREWARM_LESSON_CACHE=1).")
+    else:
+        logger.info("Lesson cache pre-warm disabled (set PREWARM_LESSON_CACHE=1 to enable).")
 
     logger.info("Bot running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
