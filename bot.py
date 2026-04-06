@@ -252,22 +252,36 @@ def save_daily_tip_history(history: list[dict]) -> None:
     save_data(data)
 
 def extract_daily_tip_expression(tip_text: str) -> str | None:
-    """Extract the expression/word from the first 🌟 *...* line."""
+    """Extract the expression/word from common tip formats."""
     # Typical format: 🌟 *All done*
     m = re.search(r"🌟\\s*\\*([^*]+)\\*", tip_text)
     if m:
         expr = m.group(1).strip()
         return expr or None
 
-    # Fallback: label line uses a generic star, expression is on the next line.
+    # Fallback 1: label line uses a generic star in markdown, expression is on the next line.
     # Example:
     # 🌟 *Word or Expression of the Day*
     # all done
     m2 = re.search(r"🌟\\s*\\*[^*]+\\*\\s*\\n\\s*([^\\n\\r]+)", tip_text)
-    if not m2:
-        return None
-    expr = m2.group(1).strip()
-    return expr or None
+    if m2:
+        expr = m2.group(1).strip()
+        return expr or None
+
+    # Fallback 2: plain-text heading, expression on next line.
+    # Example:
+    # 🌟 Word or Expression of the Day
+    # Gentle
+    m3 = re.search(
+        r"🌟\\s*Word\\s+or\\s+Expression\\s+of\\s+the\\s+Day\\s*\\n\\s*([^\\n\\r]+)",
+        tip_text,
+        flags=re.IGNORECASE,
+    )
+    if m3:
+        expr = m3.group(1).strip()
+        return expr or None
+
+    return None
 
 def generate_daily_tip_with_history() -> str:
     """Generate a daily tip, avoiding recent repetitions."""
@@ -279,12 +293,19 @@ def generate_daily_tip_with_history() -> str:
         if entry.get("date") == today and isinstance(entry.get("tip"), str):
             return entry["tip"]
 
-    recent_expr_norm = [
-        e.get("expression_norm") or (e.get("expression").casefold() if e.get("expression") else None)
-        for e in history[-7:]
-    ]
+    recent_expr_norm = []
+    recent_expr_display = []
+    for e in history[-7:]:
+        expr_display = e.get("expression") or extract_daily_tip_expression(e.get("tip", ""))
+        if expr_display:
+            recent_expr_display.append(expr_display)
+            recent_expr_norm.append(expr_display.casefold())
+            # Backfill in-memory so future save keeps normalized data.
+            if not e.get("expression"):
+                e["expression"] = expr_display
+                e["expression_norm"] = expr_display.casefold()
+
     recent_expr_norm = [x for x in recent_expr_norm if x]
-    recent_expr_display = [e.get("expression") for e in history[-7:] if e.get("expression")]
     avoid_list = ", ".join(recent_expr_display) if recent_expr_display else "none"
 
     user_message = (
