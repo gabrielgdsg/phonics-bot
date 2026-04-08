@@ -219,6 +219,14 @@ def get_all_user_ids() -> list[int]:
     return [int(uid) for uid in load_data().get("users", {}).keys()]
 
 DAILY_TIP_HISTORY_LIMIT = 14
+TIP_EXPRESSION_POOL = [
+    "all done", "tidy up", "look at that", "well done", "let's go", "come here",
+    "careful", "slow down", "listen", "inside voice", "big hug", "high five",
+    "take turns", "clean hands", "all clean", "good sharing", "wait a second",
+    "sit down", "stand up", "time to sleep", "bath time", "good morning",
+    "good night", "hungry", "thirsty", "try again", "great job", "be kind",
+    "use gentle hands", "quiet feet", "good helper", "thank you", "you're welcome",
+]
 
 def load_daily_tip_history() -> list[dict]:
     """Return recent daily tip entries stored in progress.json."""
@@ -281,7 +289,51 @@ def extract_daily_tip_expression(tip_text: str) -> str | None:
         expr = m3.group(1).strip()
         return expr or None
 
+    # Fallback 3: first non-empty line after any line containing "word or expression".
+    lines = [ln.strip() for ln in tip_text.splitlines()]
+    for i, ln in enumerate(lines):
+        simple = re.sub(r"[*_`🌟:]", "", ln).strip().casefold()
+        if "word or expression" in simple:
+            for nxt in lines[i + 1 : i + 5]:
+                if not nxt:
+                    continue
+                if nxt.startswith(("📖", "🏠", "🎵")):
+                    break
+                return nxt.strip(" -*_`")
+
     return None
+
+def build_tip_prompt_for_expression(expr: str, recent_expr_display: list[str]) -> str:
+    avoid_list = ", ".join(recent_expr_display) if recent_expr_display else "none"
+    return (
+        DAILY_TIP_PROMPT
+        + "\n\n"
+        + "MANDATORY RULES:\n"
+        + f"- Use EXACTLY this expression today: {expr}\n"
+        + "- Keep the exact section structure.\n"
+        + f"- Do NOT use any of these recent expressions: {avoid_list}\n"
+    )
+
+def pick_non_repeating_expression(recent_expr_norm: list[str]) -> str:
+    used = set(recent_expr_norm)
+    for expr in TIP_EXPRESSION_POOL:
+        if expr.casefold() not in used:
+            return expr
+    # If everything in pool was used recently, cycle by day.
+    return TIP_EXPRESSION_POOL[date.today().toordinal() % len(TIP_EXPRESSION_POOL)]
+
+def build_fallback_tip(expr: str) -> str:
+    return (
+        "🌟 Word or Expression of the Day\n"
+        f"{expr}\n\n"
+        "📖 What it means\n"
+        f"A useful everyday expression: \"{expr}\".\n\n"
+        "🏠 Use it at home today\n"
+        f"• \"Can you say: {expr}?\"\n"
+        f"• \"Let's use '{expr}' during play time.\"\n\n"
+        "🎵 Toddler tip\n"
+        "Use it during a short game and repeat it with gestures so it sticks naturally."
+    )
 
 def generate_daily_tip_with_history() -> str:
     """Generate a daily tip, avoiding recent repetitions."""
@@ -293,8 +345,8 @@ def generate_daily_tip_with_history() -> str:
         if entry.get("date") == today and isinstance(entry.get("tip"), str):
             return entry["tip"]
 
-    recent_expr_norm = []
-    recent_expr_display = []
+    recent_expr_norm: list[str] = []
+    recent_expr_display: list[str] = []
     for e in history[-7:]:
         expr_display = e.get("expression") or extract_daily_tip_expression(e.get("tip", ""))
         if expr_display:
@@ -306,31 +358,31 @@ def generate_daily_tip_with_history() -> str:
                 e["expression_norm"] = expr_display.casefold()
 
     recent_expr_norm = [x for x in recent_expr_norm if x]
-    avoid_list = ", ".join(recent_expr_display) if recent_expr_display else "none"
+    forced_expr = pick_non_repeating_expression(recent_expr_norm)
+    forced_expr_norm = forced_expr.casefold()
 
-    user_message = (
-        DAILY_TIP_PROMPT
-        + "\n"
-        + "Important: Do NOT repeat any expression from the last days: "
-        + f"{avoid_list}.\n"
-        + "Pick a different word/expression."
-    )
+    tip = ""
+    expr = None
+    expr_norm = None
 
-    tip = ask_claude(user_message, system=SYSTEM_EN, temperature=0.9)
-    expr = extract_daily_tip_expression(tip)
-    expr_norm = expr.casefold() if expr else None
-
-    # One retry if Claude still picked a recent expression.
-    if expr_norm and expr_norm in recent_expr_norm:
-        user_message_retry = (
-            DAILY_TIP_PROMPT
-            + "\n"
-            + f"The previous pick was {expr}. Do NOT use it.\n"
-            + "Pick a different word/expression."
-        )
-        tip = ask_claude(user_message_retry, system=SYSTEM_EN, temperature=1.0)
+    # Try a few times to force the selected expression.
+    for _ in range(3):
+        user_message = build_tip_prompt_for_expression(forced_expr, recent_expr_display)
+        tip = ask_claude(user_message, system=SYSTEM_EN, temperature=0.6)
         expr = extract_daily_tip_expression(tip)
         expr_norm = expr.casefold() if expr else None
+        if expr_norm == forced_expr_norm and expr_norm not in recent_expr_norm:
+            break
+
+    if not tip:
+        tip = build_fallback_tip(forced_expr)
+        expr = forced_expr
+        expr_norm = forced_expr_norm
+    elif expr_norm != forced_expr_norm or expr_norm in recent_expr_norm:
+        # Absolute fallback: never allow a duplicate expression.
+        tip = build_fallback_tip(forced_expr)
+        expr = forced_expr
+        expr_norm = forced_expr_norm
 
     # Upsert today's entry.
     history = [e for e in history if e.get("date") != today]
