@@ -18,7 +18,7 @@ import json
 import logging
 import tempfile
 import re
-from datetime import time, date
+from datetime import time, date, datetime
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -218,7 +218,7 @@ def get_all_user_ids() -> list[int]:
     """Return all registered chat IDs."""
     return [int(uid) for uid in load_data().get("users", {}).keys()]
 
-DAILY_TIP_HISTORY_LIMIT = 60
+DAILY_TIP_HISTORY_LIMIT = 5000
 TIP_EXPRESSION_POOL = [
     "tidy up", "take turns", "inside voice", "outside voice", "good helper",
     "all set", "almost there", "one more time", "have a go", "give it a try",
@@ -237,8 +237,6 @@ TIP_EXPRESSION_POOL = [
     "can you help me?", "show me how", "what do you notice?",
     "you can choose", "almost done", "great effort", "small steps",
 ]
-TIP_NO_REPEAT_DAYS = 30
-
 def load_daily_tip_history() -> list[dict]:
     """Return recent daily tip entries stored in progress.json."""
     data = load_data()
@@ -262,7 +260,18 @@ def load_daily_tip_history() -> list[dict]:
             expr_norm = None
         if expr and not expr_norm:
             expr_norm = expr.casefold()
-        out.append({"date": entry["date"], "expression": expr, "expression_norm": expr_norm, "tip": tip})
+        created_at = entry.get("created_at")
+        if created_at is not None and not isinstance(created_at, str):
+            created_at = None
+        out.append(
+            {
+                "date": entry["date"],
+                "created_at": created_at,
+                "expression": expr,
+                "expression_norm": expr_norm,
+                "tip": tip,
+            }
+        )
     return out
 
 def save_daily_tip_history(history: list[dict]) -> None:
@@ -325,13 +334,28 @@ def build_tip_prompt_for_expression(expr: str, recent_expr_display: list[str]) -
         + f"- Do NOT use any of these recent expressions: {avoid_list}\n"
     )
 
-def pick_non_repeating_expression(recent_expr_norm: list[str]) -> str:
-    used = set(recent_expr_norm)
+def pick_non_repeating_expression(used_expr_norm: list[str]) -> str:
+    used = set(used_expr_norm)
     for expr in TIP_EXPRESSION_POOL:
         if expr.casefold() not in used:
             return expr
-    # If everything in pool was used recently, cycle by day.
-    return TIP_EXPRESSION_POOL[date.today().toordinal() % len(TIP_EXPRESSION_POOL)]
+    return ""
+
+def pick_model_generated_expression(used_expr_norm: list[str]) -> str:
+    """Ask Claude for a fresh expression not used before."""
+    used_preview = ", ".join(used_expr_norm[-200:]) if used_expr_norm else "none"
+    candidate = ask_claude(
+        "Suggest ONE useful daily-home English expression for a parent and toddler.\n"
+        "Rules:\n"
+        "- 1 to 4 words\n"
+        "- not basic greetings\n"
+        "- no punctuation except apostrophe\n"
+        "- output only the expression, no explanation\n"
+        f"- do not use any of these already-used expressions: {used_preview}",
+        system=SYSTEM_EN,
+        temperature=0.8,
+    ).strip().strip('"').strip("'")
+    return candidate
 
 def build_fallback_tip(expr: str) -> str:
     return (
@@ -346,19 +370,20 @@ def build_fallback_tip(expr: str) -> str:
         "Use it during a short game and repeat it with gestures so it sticks naturally."
     )
 
-def generate_daily_tip_with_history() -> str:
+def generate_daily_tip_with_history(force_new: bool = False) -> str:
     """Generate a daily tip, avoiding recent repetitions."""
     today = date.today().isoformat()
     history = load_daily_tip_history()
 
     # If the job runs twice, reuse today's tip.
-    for entry in history:
-        if entry.get("date") == today and isinstance(entry.get("tip"), str):
-            return entry["tip"]
+    if not force_new:
+        for entry in reversed(history):
+            if entry.get("date") == today and isinstance(entry.get("tip"), str):
+                return entry["tip"]
 
     recent_expr_norm: list[str] = []
     recent_expr_display: list[str] = []
-    for e in history[-TIP_NO_REPEAT_DAYS:]:
+    for e in history:
         expr_display = e.get("expression") or extract_daily_tip_expression(e.get("tip", ""))
         if expr_display:
             recent_expr_display.append(expr_display)
@@ -370,6 +395,17 @@ def generate_daily_tip_with_history() -> str:
 
     recent_expr_norm = [x for x in recent_expr_norm if x]
     forced_expr = pick_non_repeating_expression(recent_expr_norm)
+    if not forced_expr:
+        # Pool exhausted: generate a new unique expression dynamically.
+        for _ in range(5):
+            candidate = pick_model_generated_expression(recent_expr_norm)
+            candidate_norm = candidate.casefold()
+            if candidate and candidate_norm not in recent_expr_norm:
+                forced_expr = candidate
+                break
+    if not forced_expr:
+        forced_expr = f"useful phrase {date.today().isoformat()}"
+
     forced_expr_norm = forced_expr.casefold()
 
     tip = ""
@@ -396,8 +432,15 @@ def generate_daily_tip_with_history() -> str:
         expr_norm = forced_expr_norm
 
     # Upsert today's entry.
-    history = [e for e in history if e.get("date") != today]
-    history.append({"date": today, "expression": expr, "expression_norm": expr_norm, "tip": tip})
+    history.append(
+        {
+            "date": today,
+            "created_at": datetime.utcnow().isoformat(timespec="seconds"),
+            "expression": expr,
+            "expression_norm": expr_norm,
+            "tip": tip,
+        }
+    )
     save_daily_tip_history(history)
     return tip
 
@@ -993,6 +1036,11 @@ async def tip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     tip = generate_daily_tip_with_history()
     await update.message.reply_text(tip, parse_mode="Markdown")
 
+async def nexttip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("✨ Getting a fresh new tip...")
+    tip = generate_daily_tip_with_history(force_new=True)
+    await update.message.reply_text(tip, parse_mode="Markdown")
+
 
 async def reading_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("📚 Getting reading tips...")
@@ -1023,6 +1071,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "*English learning:*\n"
         "🔊 /falar <word> — hear correct pronunciation\n"
         "💡 /tip — word of the day\n"
+        "🆕 /nexttip — force a different tip now\n"
         "📖 /reading — literacy guidance\n\n"
         "Or send any text or voice message!",
         parse_mode="Markdown",
@@ -1386,6 +1435,7 @@ def main() -> None:
     app.add_handler(CommandHandler("next",       next_command))
     app.add_handler(CommandHandler("lesson",     lesson_command))
     app.add_handler(CommandHandler("tip",        tip_command))
+    app.add_handler(CommandHandler("nexttip",    nexttip_command))
     app.add_handler(CommandHandler("reading",    reading_command))
     app.add_handler(CommandHandler("falar",      falar_command))
     app.add_handler(CommandHandler("atividade",  atividade_command))
