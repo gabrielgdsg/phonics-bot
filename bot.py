@@ -218,15 +218,26 @@ def get_all_user_ids() -> list[int]:
     """Return all registered chat IDs."""
     return [int(uid) for uid in load_data().get("users", {}).keys()]
 
-DAILY_TIP_HISTORY_LIMIT = 14
+DAILY_TIP_HISTORY_LIMIT = 60
 TIP_EXPRESSION_POOL = [
-    "all done", "tidy up", "look at that", "well done", "let's go", "come here",
-    "careful", "slow down", "listen", "inside voice", "big hug", "high five",
-    "take turns", "clean hands", "all clean", "good sharing", "wait a second",
-    "sit down", "stand up", "time to sleep", "bath time", "good morning",
-    "good night", "hungry", "thirsty", "try again", "great job", "be kind",
-    "use gentle hands", "quiet feet", "good helper", "thank you", "you're welcome",
+    "tidy up", "take turns", "inside voice", "outside voice", "good helper",
+    "all set", "almost there", "one more time", "have a go", "give it a try",
+    "you did it", "nice and steady", "easy does it", "little by little",
+    "hands to yourself", "use your words", "show me", "tell me more",
+    "what happened?", "let's check", "let me help", "my turn, your turn",
+    "first... then...", "all set to go", "time to switch", "clean as you go",
+    "pop it back", "put it away", "line it up", "match them up",
+    "spot the difference", "let's figure it out", "choose one", "good noticing",
+    "that makes sense", "great thinking", "good question", "that's tricky",
+    "let's practice", "keep trying", "you are improving", "nice teamwork",
+    "be patient", "take a breath", "quiet hands", "walking feet",
+    "eyes on me", "listen carefully", "say it slowly", "try it again",
+    "I can do hard things", "that's enough", "all finished", "not yet",
+    "ready when you are", "let's tidy together", "use gentle hands",
+    "can you help me?", "show me how", "what do you notice?",
+    "you can choose", "almost done", "great effort", "small steps",
 ]
+TIP_NO_REPEAT_DAYS = 30
 
 def load_daily_tip_history() -> list[dict]:
     """Return recent daily tip entries stored in progress.json."""
@@ -347,7 +358,7 @@ def generate_daily_tip_with_history() -> str:
 
     recent_expr_norm: list[str] = []
     recent_expr_display: list[str] = []
-    for e in history[-7:]:
+    for e in history[-TIP_NO_REPEAT_DAYS:]:
         expr_display = e.get("expression") or extract_daily_tip_expression(e.get("tip", ""))
         if expr_display:
             recent_expr_display.append(expr_display)
