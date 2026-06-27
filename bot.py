@@ -6,11 +6,13 @@ Features:
   /next en|pt      — jump to your next lesson automatically
   /lesson en|pt N  — open a specific lesson
   /semana          — generate a full weekly activity plan (PT) with printout bundle
+  /musica          — children's songs with lyrics, chords, and tips (from DB)
   /atividade       — today's activity idea in Portuguese
   /atividades en   — today's activity idea in English
   /falar <word>    — bot sends a voice message pronouncing the word correctly (TTS)
   Daily morning message: English tip + Portuguese activity nudge
-  Progress saved in progress.json
+  Progress saved in PostgreSQL (users + lessons tables) when DATABASE_URL is set,
+  otherwise progress.json / cache.json locally.
 """
 
 import os
@@ -99,6 +101,230 @@ def init_kv_table() -> None:
             conn.commit()
     except Exception as e:
         logger.warning("Postgres KV init failed; falling back to local files: %s", e)
+
+# ── Course tables (lessons, users, weekly_plans) ─────────────────────────────
+
+_course_db_ready: bool | None = None
+
+def course_db_ready() -> bool:
+    """True when the lessons table exists and has at least one PT lesson."""
+    global _course_db_ready
+    if _course_db_ready is not None:
+        return _course_db_ready
+    if not db_available():
+        _course_db_ready = False
+        return False
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.tables WHERE table_name = 'lessons' LIMIT 1"
+                )
+                if not cur.fetchone():
+                    _course_db_ready = False
+                    return False
+                cur.execute("SELECT 1 FROM lessons WHERE lang = 'pt' AND num = 1 LIMIT 1")
+                _course_db_ready = cur.fetchone() is not None
+    except Exception as e:
+        logger.warning("Course DB check failed; using local fallbacks: %s", e)
+        _course_db_ready = False
+    return _course_db_ready
+
+def fetch_lesson_row(lang: str, num: int) -> dict | None:
+    if not db_available():
+        return None
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT title, words, sentences, tips, enrichment, note
+                    FROM lessons WHERE lang = %s AND num = %s
+                    """,
+                    (lang, num),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+    except Exception as e:
+        logger.warning("lessons SELECT failed: %s", e)
+        return None
+
+def format_lesson_body(row: dict, lang: str) -> str:
+    parts = [row["tips"]]
+    words = row.get("words") or []
+    sentences = row.get("sentences") or []
+    if words:
+        label = "Palavras" if lang == "pt" else "Words"
+        parts.append(f"\n*{label}:* " + ", ".join(words))
+    if sentences:
+        label = "Frases" if lang == "pt" else "Sentences"
+        parts.append(f"\n*{label}:*\n" + "\n".join(f"• {s}" for s in sentences))
+    return "\n".join(parts)
+
+def migrate_kv_users_to_db() -> None:
+    """One-time import of progress.json / bot_kv users into the users table."""
+    if not course_db_ready():
+        return
+    raw = kv_get("data") if db_available() else None
+    if not isinstance(raw, dict) and PROGRESS_FILE.exists():
+        try:
+            raw = json.loads(PROGRESS_FILE.read_text())
+        except Exception:
+            raw = None
+    if not isinstance(raw, dict):
+        return
+    lessons = raw.get("lessons", {})
+    users = raw.get("users", {})
+    if not users and not lessons:
+        return
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                for uid, cfg in users.items():
+                    if not isinstance(cfg, dict):
+                        cfg = {}
+                    cur.execute(
+                        """
+                        INSERT INTO users (
+                            chat_id, lang, daily_tip, daily_activity, activity_lang,
+                            en_lesson, pt_lesson
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (chat_id) DO NOTHING
+                        """,
+                        (
+                            int(uid),
+                            cfg.get("lang", "en"),
+                            bool(cfg.get("daily_tip", True)),
+                            bool(cfg.get("daily_activity", False)),
+                            cfg.get("activity_lang", "en"),
+                            int(lessons.get("en", 1)),
+                            int(lessons.get("pt", 1)),
+                        ),
+                    )
+            conn.commit()
+        logger.info("Migrated %d user(s) from local progress into users table", len(users))
+    except Exception as e:
+        logger.warning("User migration to DB failed: %s", e)
+
+def init_course_db() -> None:
+    if not course_db_ready():
+        logger.info("Course DB not ready — using hardcoded lessons + local files.")
+        return
+    migrate_kv_users_to_db()
+    logger.info("Course DB ready — lessons, users, and weekly_plans active.")
+
+def daily_tips_db_count(lang: str = "en") -> int:
+    if not db_available():
+        return 0
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS n FROM daily_tips WHERE lang = %s", (lang,))
+                return int(cur.fetchone()["n"])
+    except Exception:
+        return 0
+
+def tip_number_for_date(d: date | None = None) -> int:
+    d = d or date.today()
+    return d.timetuple().tm_yday
+
+def fetch_daily_tip_row(lang: str, tip_number: int) -> dict | None:
+    if not db_available():
+        return None
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT word, definition, example_1, example_2, toddler_tip
+                    FROM daily_tips WHERE lang = %s AND tip_number = %s
+                    """,
+                    (lang, tip_number),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+    except Exception as e:
+        logger.warning("daily_tips SELECT failed: %s", e)
+        return None
+
+def format_daily_tip_row(row: dict) -> str:
+    return (
+        f"🌟 *{row['word']}*\n\n"
+        f"📖 *What it means*\n{row['definition']}\n\n"
+        f"🏠 *Use it at home today*\n"
+        f"• {row['example_1']}\n"
+        f"• {row['example_2']}\n\n"
+        f"🎵 *Toddler tip*\n{row['toddler_tip']}\n\n"
+        "_(do banco de dados — sem custo de API)_"
+    )
+
+def fetch_songs(lang: str = "pt") -> list[dict]:
+    if not db_available():
+        return []
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, title, category FROM songs WHERE lang = %s ORDER BY title",
+                    (lang,),
+                )
+                return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        logger.warning("songs list failed: %s", e)
+        return []
+
+def fetch_song(lang: str, query: str) -> dict | None:
+    if not db_available():
+        return None
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                if query.isdigit():
+                    cur.execute(
+                        """
+                        SELECT title, lyrics, chords, vocabulary_tips, youtube_url, category
+                        FROM songs WHERE lang = %s AND id = %s
+                        """,
+                        (lang, int(query)),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT title, lyrics, chords, vocabulary_tips, youtube_url, category
+                        FROM songs WHERE lang = %s AND title ILIKE %s
+                        LIMIT 1
+                        """,
+                        (lang, f"%{query}%"),
+                    )
+                row = cur.fetchone()
+                return dict(row) if row else None
+    except Exception as e:
+        logger.warning("song fetch failed: %s", e)
+        return None
+
+def format_song_message(song: dict) -> list[str]:
+    """Return message chunks (Telegram limit ~4096)."""
+    parts = [
+        f"🎵 *{song['title']}* _({song.get('category', 'song')})_\n",
+        f"📝 *Letra*\n{song['lyrics']}\n",
+    ]
+    if song.get("chords"):
+        parts.append(f"🎸 *Cifra*\n```\n{song['chords']}\n```\n")
+    if song.get("vocabulary_tips"):
+        parts.append(song["vocabulary_tips"])
+    if song.get("youtube_url"):
+        parts.append(f"\n▶️ [YouTube]({song['youtube_url']})")
+
+    full = "\n".join(parts)
+    if len(full) <= 4000:
+        return [full]
+    chunks = []
+    for block in parts:
+        if chunks and len(chunks[-1]) + len(block) < 3900:
+            chunks[-1] += "\n" + block
+        else:
+            chunks.append(block)
+    return chunks
 
 def kv_get(key: str) -> dict | None:
     if not db_available():
@@ -192,6 +418,23 @@ def save_data(data: dict) -> None:
 
 def register_user(chat_id: int) -> None:
     """Auto-register a user with default config when they send /start."""
+    if course_db_ready():
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO users (chat_id) VALUES (%s)
+                        ON CONFLICT (chat_id) DO NOTHING
+                        """,
+                        (chat_id,),
+                    )
+                conn.commit()
+            logger.info("User registered in DB: %s", chat_id)
+            return
+        except Exception as e:
+            logger.warning("DB register_user failed; falling back: %s", e)
+
     data = load_data()
     uid = str(chat_id)
     if uid not in data.get("users", {}):
@@ -199,16 +442,54 @@ def register_user(chat_id: int) -> None:
         save_data(data)
         logger.info(f"New user registered: {chat_id}")
 
+def _user_config_from_row(row: dict) -> dict:
+    return {
+        "lang": row["lang"],
+        "daily_tip": row["daily_tip"],
+        "daily_activity": row["daily_activity"],
+        "activity_lang": row["activity_lang"],
+    }
+
 def get_user_config(chat_id: int) -> dict:
+    if course_db_ready():
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT * FROM users WHERE chat_id = %s", (chat_id,))
+                    row = cur.fetchone()
+                    if not row:
+                        cur.execute(
+                            "INSERT INTO users (chat_id) VALUES (%s) RETURNING *",
+                            (chat_id,),
+                        )
+                        row = cur.fetchone()
+                    conn.commit()
+                    return _user_config_from_row(dict(row))
+        except Exception as e:
+            logger.warning("DB get_user_config failed; falling back: %s", e)
+
     data = load_data()
     uid = str(chat_id)
-    # Register on first access if not yet known
     if uid not in data.get("users", {}):
         data.setdefault("users", {})[uid] = DEFAULT_CONFIG.copy()
         save_data(data)
     return data["users"][uid]
 
 def set_user_config(chat_id: int, key: str, value) -> None:
+    if course_db_ready() and key in DEFAULT_CONFIG:
+        col = key
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"UPDATE users SET {col} = %s WHERE chat_id = %s",
+                        (value, chat_id),
+                    )
+                conn.commit()
+            return
+        except Exception as e:
+            logger.warning("DB set_user_config failed; falling back: %s", e)
+
     data = load_data()
     uid = str(chat_id)
     data.setdefault("users", {}).setdefault(uid, DEFAULT_CONFIG.copy())[key] = value
@@ -216,7 +497,31 @@ def set_user_config(chat_id: int, key: str, value) -> None:
 
 def get_all_user_ids() -> list[int]:
     """Return all registered chat IDs."""
+    if course_db_ready():
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT chat_id FROM users")
+                    return [int(r["chat_id"]) for r in cur.fetchall()]
+        except Exception as e:
+            logger.warning("DB get_all_user_ids failed; falling back: %s", e)
     return [int(uid) for uid in load_data().get("users", {}).keys()]
+
+def get_user_lesson_progress(chat_id: int) -> dict:
+    if course_db_ready():
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT en_lesson, pt_lesson FROM users WHERE chat_id = %s",
+                        (chat_id,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return {"en": int(row["en_lesson"]), "pt": int(row["pt_lesson"])}
+        except Exception as e:
+            logger.warning("DB get_user_lesson_progress failed; falling back: %s", e)
+    return load_data().get("lessons", {"en": 1, "pt": 1})
 
 DAILY_TIP_HISTORY_LIMIT = 5000
 TIP_EXPRESSION_POOL = [
@@ -371,14 +676,24 @@ def build_fallback_tip(expr: str) -> str:
     )
 
 def generate_daily_tip_with_history(force_new: bool = False) -> str:
-    """Generate a daily tip, avoiding recent repetitions."""
-    today = date.today().isoformat()
+    """Return today's tip — from DB pool when available, else Claude."""
+    today = date.today()
+    tip_num = tip_number_for_date(today)
+
+    if not force_new and daily_tips_db_count("en") > 0:
+        row = fetch_daily_tip_row("en", tip_num)
+        if not row:
+            row = fetch_daily_tip_row("en", ((tip_num - 1) % daily_tips_db_count("en")) + 1)
+        if row:
+            return format_daily_tip_row(row)
+
     history = load_daily_tip_history()
 
-    # If the job runs twice, reuse today's tip.
+    # If the job runs twice, reuse today's tip (Claude path only).
+    today_iso = today.isoformat()
     if not force_new:
         for entry in reversed(history):
-            if entry.get("date") == today and isinstance(entry.get("tip"), str):
+            if entry.get("date") == today_iso and isinstance(entry.get("tip"), str):
                 return entry["tip"]
 
     recent_expr_norm: list[str] = []
@@ -434,7 +749,7 @@ def generate_daily_tip_with_history(force_new: bool = False) -> str:
     # Upsert today's entry.
     history.append(
         {
-            "date": today,
+            "date": today_iso,
             "created_at": datetime.utcnow().isoformat(timespec="seconds"),
             "expression": expr,
             "expression_norm": expr_norm,
@@ -479,32 +794,103 @@ def save_cache(cache: dict) -> None:
     CACHE_FILE.write_text(json.dumps(cache, indent=2))
 
 def get_cached_lesson(lang: str, num: int) -> str | None:
+    row = fetch_lesson_row(lang, num)
+    if row and row.get("enrichment"):
+        return row["enrichment"]
     return load_cache().get("lessons", {}).get(f"{lang}_{num}")
 
 def set_cached_lesson(lang: str, num: int, text: str) -> None:
+    if course_db_ready():
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE lessons SET enrichment = %s
+                        WHERE lang = %s AND num = %s
+                        """,
+                        (text, lang, num),
+                    )
+                    updated = cur.rowcount
+                conn.commit()
+            if updated:
+                return
+        except Exception as e:
+            logger.warning("DB set_cached_lesson failed; falling back to file cache: %s", e)
     cache = load_cache()
     cache.setdefault("lessons", {})[f"{lang}_{num}"] = text
     save_cache(cache)
 
 def get_cached_semana() -> str | None:
     """Return cached weekly plan if it's from the current ISO week."""
+    current_week = date.today().strftime("%G-W%V")
+    if course_db_ready():
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT plan_pt FROM weekly_plans WHERE week_iso = %s",
+                        (current_week,),
+                    )
+                    row = cur.fetchone()
+                    if row and row.get("plan_pt"):
+                        return row["plan_pt"]
+        except Exception as e:
+            logger.warning("DB get_cached_semana failed; falling back: %s", e)
+
     cache = load_cache()
     semana = cache.get("semana", {})
-    current_week = date.today().strftime("%G-W%V")
     if semana.get("week") == current_week:
         return semana.get("plan")
     return None
 
 def set_cached_semana(plan: str) -> None:
+    current_week = date.today().strftime("%G-W%V")
+    if course_db_ready():
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO weekly_plans (week_iso, plan_pt)
+                        VALUES (%s, %s)
+                        ON CONFLICT (week_iso) DO UPDATE
+                        SET plan_pt = EXCLUDED.plan_pt
+                        """,
+                        (current_week, plan),
+                    )
+                conn.commit()
+            return
+        except Exception as e:
+            logger.warning("DB set_cached_semana failed; falling back: %s", e)
+
     cache = load_cache()
-    cache["semana"] = {
-        "week": date.today().strftime("%G-W%V"),
-        "plan": plan,
-    }
+    cache["semana"] = {"week": current_week, "plan": plan}
     save_cache(cache)
 
 def lessons_cache_complete() -> bool:
-    """True if all 64 lessons are already cached."""
+    """True if all 64 lessons have enrichment (DB or file cache)."""
+    if course_db_ready():
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT COUNT(*) AS n FROM lessons
+                        WHERE enrichment IS NOT NULL AND num BETWEEN 1 AND 32
+                        """
+                    )
+                    row = cur.fetchone()
+                    if row and int(row["n"]) >= 64:
+                        return True
+                    if row and int(row["n"]) >= 32:
+                        cur.execute(
+                            "SELECT COUNT(*) AS n FROM lessons WHERE lang = 'en' LIMIT 1"
+                        )
+                        if int(cur.fetchone()["n"]) == 0:
+                            return False
+        except Exception as e:
+            logger.warning("DB lessons_cache_complete check failed: %s", e)
     cached = load_cache().get("lessons", {})
     return all(f"{lang}_{n}" in cached for lang in ("en", "pt") for n in range(1, 33))
 
@@ -520,7 +906,7 @@ async def prewarm_lessons_cache() -> None:
         system = SYSTEM_PT if lang == "pt" else SYSTEM_EN
         for num in range(1, 33):
             if get_cached_lesson(lang, num):
-                continue  # already cached
+                continue  # already in DB or file cache
             label, tips = get_lesson_info(lang, num)
             if lang == "pt":
                 prompt = (
@@ -541,18 +927,41 @@ async def prewarm_lessons_cache() -> None:
 
     logger.info("Lesson cache pre-warm complete — all 64 lessons cached forever.")
 
-def get_next_lesson(lang: str) -> int:
-    return load_data().get("lessons", {}).get(lang, 1)
+def get_next_lesson(lang: str, chat_id: int) -> int:
+    return get_user_lesson_progress(chat_id).get(lang, 1)
 
-def mark_lesson_done(lang: str, num: int) -> None:
+def mark_lesson_done(lang: str, num: int, chat_id: int) -> None:
+    if course_db_ready():
+        col = "en_lesson" if lang == "en" else "pt_lesson"
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT {col} FROM users WHERE chat_id = %s",
+                        (chat_id,),
+                    )
+                    row = cur.fetchone()
+                    current = int(row[col]) if row else 1
+                    if num >= current:
+                        cur.execute(
+                            f"UPDATE users SET {col} = %s WHERE chat_id = %s",
+                            (min(num + 1, 32), chat_id),
+                        )
+                conn.commit()
+            return
+        except Exception as e:
+            logger.warning("DB mark_lesson_done failed; falling back: %s", e)
+
     data = load_data()
     lessons = data.setdefault("lessons", {"en": 1, "pt": 1})
     if num >= lessons.get(lang, 1):
         lessons[lang] = min(num + 1, 32)
     save_data(data)
 
-def load_progress() -> dict:
-    """Backwards compat shim — returns lesson progress."""
+def load_progress(chat_id: int | None = None) -> dict:
+    """Backwards compat shim — returns lesson progress for a user."""
+    if chat_id is not None:
+        return get_user_lesson_progress(chat_id)
     return load_data().get("lessons", {"en": 1, "pt": 1})
 
 def save_progress(progress: dict) -> None:
@@ -707,44 +1116,51 @@ CLR_EN_LESSONS = {
 
 # ── Portuguese phonics lesson data (32 individual entries) ────────────────────
 CLR_PT_LESSONS = {
-    (1,1):  ("Vogal A", "Apresente apenas a letra A hoje. Diga o SOM 'ah' — não o nome. Palavras: AMÁ, AI, AVÓ. Aponte para objetos reais: ÁGUA, AVIÃO. Sessão de 3 minutos. Repita 'A... A... A...' e deixe ela copiar. Uma letra, muitas repetições — só isso por hoje."),
+    (1,1):  ("Vogal A", "Apresente apenas a letra A hoje. Diga o SOM 'ah' — não o nome. Palavras: ANA, ASA, AI, AVÓ, ALÔ. ANA no começo — nome curto. ÁGUA fica para a lição 18 (som GU). ALÔ na hora de brincar de telefone."),
     (2,2):  ("Vogal E", "Som novo: 'eh' como em ELA. Palavras: ELA, EU, ELE. Compare com o A da sessão anterior — segure dois cartões e peça para ela apontar para o A, depois o E. A diferença entre 'ah' e 'eh' é a lição toda de hoje."),
     (3,3):  ("Vogal I", "Som novo: 'ee' como em IDA. Palavras: IDA, IR, IA. Agora você tem A E I — jogue um jogo simples: fale um som, ela aponta para o cartão certo. 'Onde está o I?' Três vogais já são suficientes para uma criança pequena. Elogie cada acerto."),
     (4,4):  ("Vogal O", "Som novo: 'oh' como em OVO. Palavras: OVO, OI, OSO. OI é perfeito — ela fala toda hora como cumprimento. Mostre a palavra OI e veja a reação dela. Quatro vogais agora: A E I O."),
     (5,5):  ("Vogal U", "Som novo: 'u' como em UVA. Palavras: UVA, UM, UÊ. Segure uma uva (ou figura) e diga U-VA devagar. Agora você tem as cinco vogais. Passe essa sessão toda revisando: A E I O U em ordem, depois misturadas."),
     (6,6):  ("Revisão das 5 vogais", "Sem letra nova hoje. Revisão completa: A E I O U. Coloque os cinco cartões no chão. Fale um som — ela corre para o cartão certo. Torne físico e divertido. Cronometre quantos segundos ela leva para achar cada um. Comemore cada acerto. Essa é a base de tudo."),
-    (7,7):  ("Consoante M", "Som novo: 'mm' — lábios fechados, depois abre. Palavras: MÃE, MÃO, MAMÃ, MIAU. MÃE é a palavra mais poderosa do vocabulário dela — ver escrita pela primeira vez é um momento especial. Una devagar: M... Ã... E... = MÃE. Deixe ela segurar o cartão quando acertar."),
-    (8,8):  ("Consoante P", "Som novo: 'p' — um pequeno sopro de ar. Palavras: PAI, PÉ, PIA, PIPA. PAI é sua arma secreta — ela fala dezenas de vezes por dia. O momento em que ela ler PAI sozinha será inesquecível. Una: P... A... I... = PAI. Pratique MÃE + PAI lado a lado."),
-    (9,9):  ("Consoante B", "Som novo: 'b' — como P mas com voz. Palavras: BOLA, BEBÊ, BOCA. Role uma bola pelo chão e diga B-O-L-A a cada rolada. A ação física grava a palavra. Tente também BEBÊ com uma boneca — ela pode segurar o 'bebê' enquanto lê o cartão."),
-    (10,10):("Consoante T + Revisão", "Som novo: 't' — língua no céu da boca. Palavras: TATU, TETO, PATO, BOTA. Revise M P B primeiro — passe pelos cartões antes de introduzir o T. PATO é ótimo: faça ele grasnar toda vez que ela ler. Frases: 'O PATO É MIO.' 'A BOTA É MIA.'"),
-    (11,11):("Consoante D", "Som novo: 'd' — como T mas com voz. Palavras: DEDO, DADO, DORME. Toque o dedo dela e diga D-E-D-O — a palavra e a parte do corpo ao mesmo tempo. Essa conexão tátil é poderosa para crianças pequenas. Tente DORME na hora de dormir: 'hora de DORME?'"),
-    (12,12):("Consoante V", "Som novo: 'v' — dente de cima no lábio de baixo, vibrando. Palavras: VACA, VELA, VOVÓ, UVA. VOVÓ é emocionalmente poderosa — se a avó é presente na vida dela, ver o nome escrito é mágico. Faça a vaca mugir para VACA. Segure uma uva para UVA."),
-    (13,13):("Consoante F", "Som novo: 'f' — mesma posição que o V mas sem vibração. Palavras: FADA, FOCA, FOFA, FOME. FOFA ela ouve o tempo todo — 'que FOFA!' Ver escrito vai arrancá-la uma gargalhada. Compare V e F: mesma boca, um vibra, o outro não."),
-    (14,14):("Consoante N", "Som novo: 'n' — língua no céu da boca, som sai pelo nariz. Palavras: NANA, NINHO, NEVE, NABO. Use NANA na hora de dormir — é a palavra mais suave do conjunto. 'NANA, NANA' enquanto balança. NINHO com figura de ninho de pássaro é bonito e memorável."),
-    (15,15):("Revisão geral — Lição 15", "Sem letra nova. Revisão completa das lições 7–14: M P B T D V F N. Coloque todos os cartões no chão. Você fala FADA, ela acha. Depois troca: ela escolhe um cartão, você lê juntos. Comemore cada acerto em voz alta. Anote quais palavras ela hesita — revise essas amanhã."),
-    (16,16):("Consoante L", "Som novo: 'l' — ponta da língua no céu, lados abertos. Palavras: LEÃO, LOBO, BOLO, LAMA, LUA. BOLO é ótimo motivador — prometa um bolo de verdade depois de uma boa sessão! LEÃO e LOBO são animais empolgantes. LUA é linda para uma sessão noturna — olhem a lua juntos."),
-    (17,17):("Consoante C (CA CO CU)", "Som novo: 'k' duro — MAS APENAS antes de A, O, U hoje. Palavras: CAMA, COPO, CUBO, CUCO. CAMA é perfeita — ela conhece a própria cama profundamente. Importante: NÃO introduza CE ou CI ainda. Esses têm um som completamente diferente e chegam na lição 26. Diga claramente: 'C antes de A faz KA. C antes de O faz KO.'"),
-    (18,18):("Consoante G (GA GO GU)", "Som novo: 'g' duro — APENAS antes de A, O, U. Palavras: GATO, GOLA, GUGU, PEGA. GATO é maravilhoso se ela ama gatos. GUGU é instantaneamente reconhecível. Mesma regra do C: NÃO introduza GE ou GI ainda — chegam depois com som diferente."),
-    (19,19):("Consoante R (som suave)", "Som novo: R suave — apenas entre vogais, como em 'cara'. Palavras: CARA, PURO, FORA, CARO, TIRO. Este é o R gentil, NÃO o R forte do início das palavras. Em CARA o R é suave como um toque leve. O R forte (como em RATO) fica para o Estágio 2. Por agora: R apenas no meio das palavras."),
-    (20,20):("Consoante S", "Som novo: 's' — ar entre os dentes. Palavras: SAPO, SUCO, MESA, SOLO. SAPO PULA é uma música folclórica brasileira famosa — se ela conhece, ver SAPO escrito é um momento enorme de reconhecimento. Pergunte: 'O sapo pula... onde?' Aponte para SAPO no cartão enquanto ela canta."),
-    (21,21):("Revisão + Frases completas", "Sem letra nova. Revisão das lições 16–20: L C G R S. Agora monte frases completas com os cartões: 'O GATO DORME NA CAMA.' 'O SAPO PULA NA LAMA.' Passe o dedo sob cada palavra da esquerda para a direita ao ler em voz alta. Esse é um momento grande — ela está lendo frases em português."),
-    (22,22):("Dígrafo LH", "Som novo: LH — um som único do português, como 'lh' em 'talha' ou 'lli' em 'million'. Palavras: FILHO, FOLHA, OLHA, GALHO. OLHA! é o mais natural — você já fala o tempo todo: 'OLHA o gatinho!' 'OLHA a lua!' Use em momentos reais hoje. Toda vez que falar OLHA, aponte para algo e faça a conexão com o cartão."),
-    (23,23):("Dígrafo NH", "Som novo: NH — nasal, como 'ny' em 'canyon'. Palavras: NINHO, BANHO, MINHA, LINHA. HORA DO BANHO é dito todos os dias — escreva num cartão e mostre na hora do banho. MINHA BOLA, MINHA CAMA — o possessivo MINHA dá a ela propriedade sobre palavras que ela ama."),
-    (24,24):("Dígrafo CH", "Som novo: CH — como 'sh' em inglês. Palavras: CHÃO, CHUVA, BICHO, CHAVE. CH é na verdade fácil para crianças pequenas porque o som é muito claro. CAI NO CHÃO é algo que ela vive — crianças pequenas caem muito! Conecte a palavra ao momento real quando acontecer hoje."),
-    (25,25):("Letra X (som CH)", "Letra nova: X — mas hoje APENAS o som 'ch/sh'. Palavras: XÍCARA, XALE, PEIXE, CAIXA, ROXO. Importante: X tem quatro sons possíveis em português. Não mencione essa complexidade ainda. Ensine apenas: 'X pode soar como CH.' PEIXE é ótimo com figura ou brinquedo de peixe. CAIXA — coloque um brinquedo dentro de uma caixa e rotule."),
-    (26,26):("J e G suave (GE GI)", "Duas letras, um som: 'j' suave — como o 's' em 'leisure' em inglês. Palavras: JOGO, HOJE, GELO, GIRAFA, FEIJÃO. J sempre faz esse som. G faz esse som APENAS antes de E ou I — essa é a regra. GIRAFA é empolgante com figura ou brinquedo. FEIJÃO ela conhece da comida — ótima âncora."),
-    (27,27):("Cedilha Ç", "Símbolo novo: Ç — sempre soa como S, nunca como K. Palavras: MAÇÃ, POÇO, AÇAÍ, FAÇO. MAÇÃ é perfeita — segure uma maçã de verdade. AÇAÍ ela provavelmente adora. A cedilha (o gancho embaixo do C) é o sinal: 'este C faz som de S.' Aponte para o gancho cada vez."),
-    (28,28):("Vogais nasais: ÃO, EM, IM", "Sons novos: vogais nasais — ar sai pelo nariz E pela boca. Palavras: MÃO, PÃO, BEM, SIM, TAMBÉM. Segure a mão dela e diga MÃO DA MÃE — físico e lindo. PÃO com pão de verdade é o melhor apoio. SIM e BEM são pequeninhos mas poderosos — ela usa todo dia. Zumba o som nasal: mmm-ÃO."),
-    (29,29):("Vogais nasais: OM, UM, AN", "Mais vogais nasais. Palavras: BOM, SOM, UM, CANTO, TANTO. BOM DIA! — comece cada sessão a partir de agora com essa frase escrita num cartão. Ela fala toda manhã, agora pode ler. SOM é divertido — faça um som e pergunte 'que SOM é esse?' UM é o número um — contem coisas juntos."),
-    (30,30):("Revisão de todos os dígrafos", "Sem conteúdo novo. Revisão completa: LH NH CH X J/G-suave Ç e todas as vogais nasais. Jogue assim: ela escolhe um cartão virado para baixo, vira, lê. Cada acerto ganha um adesivo ou um high five. Anote quais dígrafos ela ainda hesita — esses recebem atenção extra antes do Estágio 2."),
-    (31,31):("Letras minúsculas — parte 1", "Mesmas palavras, agora em minúsculo: mãe, pai, bola, gato, sapo, cama. Mostre as duas versões lado a lado: MÃE / mãe. Diga: 'mesma palavra, roupa diferente.' Comece apenas com as palavras que ela conhece melhor em maiúsculo. NÃO apresse — essa é uma virada conceitual e precisa de paciência."),
-    (32,32):("Letras minúsculas + Leitura livre", "Última lição do Estágio 1. Mais minúsculas: filho, banho, chuva, maçã, girafa, leão. Depois leia um livro ilustrado brasileiro juntos — qualquer Ziraldo, A Bolsa Amarela, ou Palavra de Honra. Aponte para as palavras ao ler. Ela completou o Estágio 1. Ela está lendo. Parabéns para os dois — isso exigiu dedicação de verdade."),
+    (7,7):  ("Consoante M", "Som novo: 'mm' — lábios fechados, depois abre. Palavras: MÃE, MÃO, MIAU, MEIA, MASSA. MÃE é a palavra mais poderosa do vocabulário dela. Una devagar: M... Ã... E... = MÃE. Frases: 'AMO A MÃE.' 'MIAU MIAU.' 'MAMÃE ME AMA.' Deixe ela segurar o cartão MÃE quando acertar."),
+    (8,8):  ("Consoante P", "Som novo: 'p' — um pequeno sopro de ar. Palavras: PAI, PÉ, PIA, PATA. PAI é sua arma secreta. NINA é a cachorrinha — use em PATA DA NINA. Frases: 'AMO O PAI.' 'PATA DA NINA.' 'PULA, PAPAI!' Pratique MÃE + PAI lado a lado."),
+    (9,9):  ("Consoante B", "Som novo: 'b' — como P mas com voz. Palavras: BOLA, BEBÊ, BOCA, BABA. Role uma bola pelo chão dizendo B-O-L-A. Frases: 'BATI NA BOLA.' 'O BEBÊ BABA.' Tente BEBÊ com uma boneca enquanto lê."),
+    (10,10):("Consoante T", "Som novo: 't'. Palavras: TATU, TETO, BOTA, TEIA, TESTA. Frases: 'TEIA NO TETO.' 'TOCA A TESTA.' 'TON TON.' 'TON TON CAIU.' — TPR: toca a testa, bate na porta."),
+    (11,11):("Consoante D", "Som novo: 'd' — como T mas com voz. Palavras: DEDO, DADO, DOIS, DINDA. Frases: 'O DEDO DÓI.' 'A DINDA DORME.' 'TOCA O DEDO.' — TPR no dedo."),
+    (12,12):("Consoante V", "Som novo: 'v' — dente no lábio de baixo, vibrando. Palavras: VACA, VELA, VOVÓ, VENTO. Frases: 'A VACA FAZ MUU.' 'AMO A VOVÓ.' 'SOPRA!' — TPR: sopra junto."),
+    (13,13):("Consoante F", "Som novo: 'f' — mesma boca que V, sem vibração. Palavras: FADA, FOCA, FOFA, FOME. Frases: 'A FADA VOA.' 'TÔ COM FOME.' 'CADÊ A NINA?' — leia tô como ela fala."),
+    (14,14):("Consoante N", "Som novo: 'n' — som sai pelo nariz. Palavras: NINA, NARIZ, NADA, NUVEM. Frases: 'A NINA NADA.' 'APONTA O NARIZ.' 'OLHA A NUVEM!' — TPR em cada uma."),
+    (15,15):("Revisão Geral — Lições 7 a 14", "Sem letra nova. Revisão M P B T D V F N. Frases: 'PAI TEM BOLA.' 'EU AMO A MAMÃE.' 'CADÊ O PAPAI?' — brinque de esconder."),
+    (16,16):("Consoante L", "Som novo: 'l'. Palavras: LOBO, BOLO, LAMA, LUA, LATA. Frases: 'O LOBO UIVA.' 'QUERO BOLO!' 'LAVA A MÃO.' — TPR na hora de lavar."),
+    (17,17):("Consoante C (CA CO CU)", "Som novo: 'k' duro — APENAS antes de A, O, U. Palavras: CAMA, COPO, CUBO, CASA. Frases: 'A CASA É NOSSA.' 'VAI PARA A CAMA.' 'O COPO CAI.' NÃO introduza CE ou CI ainda."),
+    (18,18):("Consoante G (GA GO GU)", "Som 'g' duro — GA GO GU. Palavras: GATO, GOTA, GALO, GU, GOL, ÁGUA. GU é o dindo. ÁGUA agora — som GU. Frases: 'O GATO MIA.' 'O GALO CANTA.' 'GU FEZ GOL.' 'CAIU UMA GOTA.'"),
+    (19,19):("Consoante R (som suave)", "Som R suave entre vogais. Palavras: FORA, LAURA, PERA, DURO. Frases: 'VAMOS LÁ FORA!' 'OI, LAURA!' 'COME A PERA.'"),
+    (20,20):("Consoante S", "Som 's'. Palavras: SAPO, SUCO, SOPA, SOLA. Frases: 'O SAPO PULA.' 'COME A SOPA.' 'BATE PALMA.' — TPR: bate palma."),
+    (21,21):("Revisão + Frases Completas", "Sem letra nova. Revisão das lições 16–20: L C G R S. Frases: 'O GATO DORME NA CAMA.' 'O SAPO PULA NA LAMA.' 'O BOLO É DA MÃE.' Passe o dedo sob cada palavra da esquerda para a direita."),
+    (22,22):("Dígrafo LH", "Som novo: LH — som único do português. Palavras: FILHA, FOLHA, OLHA, GALHO. Frases: 'OLHA O GATO!' 'A FOLHA CAI.' 'É MINHA FILHA.' Use OLHA em momentos reais hoje."),
+    (23,23):("Dígrafo NH", "Som novo: NH — nasal, como 'ny' em canyon. Palavras: NINHO, BANHO, MINHA. Frases: 'HORA DO BANHO!' 'É MINHA BOLA.' 'DORME NO NINHO.'"),
+    (24,24):("Dígrafo CH", "Som novo: CH — como 'sh' em inglês. Palavras: CHÃO, CHUVA, BICHO, CHAVE. Frases: 'A CHUVA CAI.' 'CAI NO CHÃO.' 'QUE BICHO É?'"),
+    (25,25):("Letra X (som CH)", "Letra X — hoje APENAS o som 'ch/sh'. Palavras: XÍCARA, XALE, PEIXE, CAIXA, ROXO. Frases: 'O PEIXE NADA.' 'O PEIXE NA CAIXA.' 'OLHA O ROXO!'"),
+    (26,26):("J e G Suave (GE GI)", "Som 'j' suave. Palavras: GEGÊ, GELO, GIRAFA, JACARÉ, JOGO. Frases: 'A GIRAFA COME.' 'TOCA O GELO!' 'JOGO COM PAPAI.'"),
+    (27,27):("Cedilha Ç", "Ç sempre soa como S. Palavras: MAÇÃ, AÇAÍ, TAÇA, ALMOÇO. Frases: 'COME A MAÇÃ.' 'QUERO AÇAÍ!' 'HORA DO ALMOÇO!'"),
+    (28,28):("Vogais Nasais: ÃO, EM, IM", "Vogais nasais — ar pelo nariz e pela boca. Palavras: MÃO, PÃO, BEM, SIM, TEM. Frases: 'SIM, EU QUERO.' 'PÃO COM MEL.' 'MÃO DA MÃE.'"),
+    (29,29):("Vogais Nasais: OM, UM, AN", "Mais vogais nasais. Palavras: BOM, UM, BANCO, DANÇA. Frases: 'BOM DIA!' 'BOA NOITE!' 'HORA DA DANÇA!' — expressões do cotidiano."),
+    (30,30):("Revisão de Todos os Dígrafos", "Sem conteúdo novo. Revisão: LH NH CH X J/G-suave Ç e nasais. Frases: 'O FILHO TOMA BANHO.' 'A CHUVA CAI NA MÃO.' 'OBRIGADO!'"),
+    (31,31):("Letras Minúsculas — Parte 1", "Palavras em minúsculo: mãe, pai, bola, gato, sapo, cama. Frases: 'o gato dorme.' 'pula, nina!' 'eu amo mamãe.'"),
+    (32,32):("Letras Minúsculas + Leitura Livre", "Palavras: filho, banho, chuva, maçã, girafa, leão. Frases: 'o filho toma banho.' 'até logo!' 'a girafa come a folha.' Depois leia um livro ilustrado juntos."),
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_lesson_info(lang: str, num: int) -> tuple[str, str]:
     """Returns (label, tips) for a lesson. Tips language matches lang."""
+    row = fetch_lesson_row(lang, num)
+    if row:
+        course = "English CLR" if lang == "en" else "Português — Fonética"
+        word = "Lesson" if lang == "en" else "Lição"
+        label = f"📚 *{course} — {word} {num}: {row['title']}*"
+        return label, format_lesson_body(row, lang)
+
     data = CLR_EN_LESSONS if lang == "en" else CLR_PT_LESSONS
     for (start, end), (title, tips) in data.items():
         if start <= num <= end:
@@ -838,15 +1254,13 @@ async def text_to_speech(text: str) -> bytes | None:
         return resp.content
 
 
-async def deliver_lesson(send_fn, lang: str, num: int, mark_done: bool = False) -> None:
-    """Fetch lesson info + enrichment (from cache if available) and send to user."""
+async def deliver_lesson(send_fn, lang: str, num: int, chat_id: int, mark_done: bool = False) -> None:
+    """Fetch lesson info + enrichment (from DB if available) and send to user."""
     label, tips = get_lesson_info(lang, num)
     system = SYSTEM_PT if lang == "pt" else SYSTEM_EN
 
-    # Try cache first — instant and free
     enriched = get_cached_lesson(lang, num)
     if not enriched:
-        # Cache miss — generate and store for next time
         if lang == "pt":
             prompt = (
                 f"Vou fazer essa lição de fonética com minha filha de 2 anos agora. "
@@ -861,13 +1275,12 @@ async def deliver_lesson(send_fn, lang: str, num: int, mark_done: bool = False) 
             )
         enriched = ask_claude(prompt, system=system)
         set_cached_lesson(lang, num, enriched)
-        logger.info(f"Lesson {lang}_{num} generated and cached.")
+        logger.info("Lesson %s_%s generated on demand.", lang, num)
 
-    progress = load_progress()
-    done_emoji = "✅" if num < progress.get(lang, 1) else "▶️"
     next_num = min(num + 1, 32)
+    row = fetch_lesson_row(lang, num)
+    from_db = bool(row and row.get("enrichment"))
 
-    # Done button + next lesson button
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
@@ -881,15 +1294,20 @@ async def deliver_lesson(send_fn, lang: str, num: int, mark_done: bool = False) 
         ]
     ])
 
+    source = "_(do banco de dados)_" if from_db and lang == "pt" else ("_(from database)_" if from_db else "")
+
     await send_fn(f"{label}\n\n{tips}", parse_mode="Markdown")
+    extra_header = "💡 *Dicas extras:*" if lang == "pt" else "💡 *Extra tips:*"
+    if source:
+        extra_header += f" {source}"
     await send_fn(
-        f"{'💡 *Extra tips:*' if lang == 'en' else '💡 *Dicas extras:*'}\n\n{enriched}",
+        f"{extra_header}\n\n{enriched}",
         parse_mode="Markdown",
         reply_markup=keyboard,
     )
 
     if mark_done:
-        mark_lesson_done(lang, num)
+        mark_lesson_done(lang, num, chat_id)
 
 
 # ── Command handlers ──────────────────────────────────────────────────────────
@@ -936,7 +1354,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             InlineKeyboardButton("📅 Plano da semana",    callback_data="quick_semana"),
         ],
         [
+            InlineKeyboardButton("🎵 Músicas",            callback_data="quick_musica"),
             InlineKeyboardButton("💡 Tip of the day",     callback_data="quick_tip"),
+        ],
+        [
             InlineKeyboardButton("📖 Reading tips",       callback_data="quick_reading"),
         ],
         [
@@ -961,7 +1382,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def course_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show course selection buttons."""
-    progress = load_progress()
+    chat_id = update.effective_chat.id
+    progress = load_progress(chat_id)
     en_next = progress.get("en", 1)
     pt_next = progress.get("pt", 1)
 
@@ -996,13 +1418,14 @@ async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
     lang = args[0].lower()
-    num = get_next_lesson(lang)
+    chat_id = update.effective_chat.id
+    num = get_next_lesson(lang, chat_id)
     if num > 32:
         msg = "🎉 You've completed all 32 lessons! Well done!" if lang == "en" else "🎉 Você completou todas as 32 lições! Parabéns!"
         await update.message.reply_text(msg)
         return
     send = update.message.reply_text
-    await deliver_lesson(send, lang, num)
+    await deliver_lesson(send, lang, num, chat_id)
 
 
 async def lesson_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1027,8 +1450,9 @@ async def lesson_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Lesson number must be between 1 and 32.")
         return
 
+    chat_id = update.effective_chat.id
     send = update.message.reply_text
-    await deliver_lesson(send, lang, num)
+    await deliver_lesson(send, lang, num, chat_id)
 
 
 async def tip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1067,7 +1491,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "*Activities:*\n"
         "🎨 /atividade — activity of the day (Portuguese)\n"
         "🎨 /atividade en — activity of the day (English)\n"
-        "📅 /semana — full weekly plan + printout list\n\n"
+        "📅 /semana — full weekly plan + printout list\n"
+        "🎵 /musica — children's songs (lyrics + chords + tips)\n\n"
         "*English learning:*\n"
         "🔊 /falar <word> — hear correct pronunciation\n"
         "💡 /tip — word of the day\n"
@@ -1089,7 +1514,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Course selection → show lesson menu
     if data.startswith("course_"):
         lang = data.split("_")[1]
-        progress = load_progress()
+        chat_id = query.message.chat_id
+        progress = load_progress(chat_id)
         current = progress.get(lang, 1)
         label = "🇬🇧 English CLR" if lang == "en" else "🇧🇷 Português — Fonética"
         word = "Lesson" if lang == "en" else "Lição"
@@ -1115,13 +1541,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data.startswith("lesson_"):
         _, lang, num_str = data.split("_")
         num = int(num_str)
-        await deliver_lesson(send, lang, num)
+        await deliver_lesson(send, lang, num, query.message.chat_id)
 
     # Mark lesson as done
     elif data.startswith("done_"):
         _, lang, num_str = data.split("_")
         num = int(num_str)
-        mark_lesson_done(lang, num)
+        chat_id = query.message.chat_id
+        mark_lesson_done(lang, num, chat_id)
         next_num = min(num + 1, 32)
         word = "Lesson" if lang == "en" else "Lição"
         msg = (
@@ -1136,12 +1563,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Pinned menu: next lesson shortcuts
     elif data in ("next_en", "next_pt"):
         lang = data.split("_")[1]
-        num = get_next_lesson(lang)
+        chat_id = query.message.chat_id
+        num = get_next_lesson(lang, chat_id)
         if num > 32:
             msg = "🎉 You've completed all 32 lessons!" if lang == "en" else "🎉 Você completou todas as 32 lições!"
             await send(msg)
         else:
-            await deliver_lesson(send, lang, num)
+            await deliver_lesson(send, lang, num, chat_id)
 
     # Pinned menu: quick tip
     elif data == "quick_tip":
@@ -1167,6 +1595,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await send("🎨 Buscando a atividade do dia...")
         activity = ask_claude(DAILY_ACTIVITY_PROMPT, system=SYSTEM_ACTIVITIES_PT)
         await send(activity, parse_mode="Markdown")
+
+    # Pinned menu: songs
+    elif data == "quick_musica":
+        songs = fetch_songs("pt")
+        if not songs:
+            await send(
+                "🎵 Ainda não há músicas no banco. Rode `seed_songs.py` ou gere com SONGS_AND_TIPS_GENERATION.md."
+            )
+        else:
+            lines = "\n".join(f"• {s['title']}" for s in songs)
+            await send(
+                f"🎵 *Músicas disponíveis:*\n{lines}\n\n"
+                "Use `/musica Sapo Cururu` para ver letra, cifra e dicas.",
+                parse_mode="Markdown",
+            )
 
     # Pinned menu: weekly plan
     elif data == "quick_semana":
@@ -1351,6 +1794,35 @@ async def atividade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(result, parse_mode="Markdown")
 
 
+async def musica_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/musica — list songs or show one by name."""
+    args = context.args
+    if not args:
+        songs = fetch_songs("pt")
+        if not songs:
+            await update.message.reply_text(
+                "🎵 Nenhuma música no banco ainda.\n"
+                "As músicas são carregadas via `seed_songs.py` ou os prompts em SONGS_AND_TIPS_GENERATION.md."
+            )
+            return
+        lines = "\n".join(f"{i}. {s['title']}" for i, s in enumerate(songs, 1))
+        await update.message.reply_text(
+            f"🎵 *Músicas para cantar com a Laura:*\n{lines}\n\n"
+            "Exemplo: `/musica Sapo Cururu`",
+            parse_mode="Markdown",
+        )
+        return
+
+    query = " ".join(args)
+    song = fetch_song("pt", query)
+    if not song:
+        await update.message.reply_text(f"Não encontrei \"{query}\". Use `/musica` para ver a lista.", parse_mode="Markdown")
+        return
+
+    for chunk in format_song_message(song):
+        await update.message.reply_text(chunk, parse_mode="Markdown")
+
+
 async def semana_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/semana — full weekly activity plan, cached per ISO week."""
     plan = get_cached_semana()
@@ -1428,6 +1900,11 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     init_usage_table()
     init_kv_table()
+    init_course_db()
+    if daily_tips_db_count("en") == 0:
+        logger.info("daily_tips empty — run: python seed_daily_tips.py")
+    if not fetch_songs("pt"):
+        logger.info("songs empty — run: python seed_songs.py")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start",      start))
@@ -1441,6 +1918,7 @@ def main() -> None:
     app.add_handler(CommandHandler("atividade",  atividade_command))
     app.add_handler(CommandHandler("atividades", atividade_command))
     app.add_handler(CommandHandler("semana",     semana_command))
+    app.add_handler(CommandHandler("musica",     musica_command))
     app.add_handler(CommandHandler("config",     config_command))
     app.add_handler(CommandHandler("help",       help_command))
     app.add_handler(CallbackQueryHandler(button_callback))
